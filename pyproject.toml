@@ -1,0 +1,61 @@
+[project]
+name = "rika-mangas"
+version = "0.1.0"
+description = "Motor de colorización offline de manga y cómic optimizado para 6GB VRAM"
+readme = "README.md"
+authors = [
+    { name = "Ker825", email = "cisnerosriveradiegoemmanuel@gmail.com" }
+]
+license = { text = "MIT" }
+requires-python = ">=3.12, <3.14"
+dependencies = [
+    "accelerate>=1.2.1",
+    "diffusers>=0.32.1",
+    "einops>=0.8.0",
+    "fastapi>=0.115.6",
+    "jinja2>=3.1.4",
+    "numpy>=2.0.0",
+    "opencv-python>=4.10.0",
+    "pillow>=11.0.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "python-multipart>=0.0.20",
+    "safetensors>=0.5.0",
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
+    "transformers>=4.48.0",
+    "uvicorn[standard]>=0.34.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.15,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.mypy]
+mypy_path = "src"
+explicit_package_bases = true
+
+[tool.ruff]
+line-length = 135
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+
+[[tool.mypy.overrides]]
+module = [
+    "cv2.*",
+    "cv2",
+    "diffusers.*",
+    "transformers.*",
+    "torchvision.*",
+    "PIL.*",
+    "einops.*",
+    "accelerate.*",
+]
+ignore_missing_imports = true
