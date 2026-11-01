@@ -1,30 +1,17 @@
 from pathlib import Path
-from typing import Any
 
 import cv2
-import numpy as np
 
-from rika_mangas.config import settings
+from rika_mangas.application.hints.guided_hints import DeterministicGuidedHints
 from rika_mangas.core.postprocessor import PostProcessor
-from rika_mangas.domain.models.presets import get_style
-from rika_mangas.domain.ports.ports import IColorizerEngine, IUpscalerEngine
+from rika_mangas.domain.models.presets import StylePreset, get_style
 
 
 class ColorizationOrchestrator:
-    def __init__(
-        self,
-        colorizer: IColorizerEngine,
-        upscaler: IUpscalerEngine | None = None,
-    ) -> None:
+    def __init__(self, colorizer, upscaler=None, hints_detector=None) -> None:
         self._colorizer = colorizer
         self._upscaler = upscaler
-        # Se desactivan máscaras destructivas y preservación neutra
-        self._postprocessor = PostProcessor(
-            style=get_style("neutral"),
-            hard_masks=False,
-            neutral_preservation=False,
-            l_channel=True,
-        )
+        self._hints_detector = hints_detector or DeterministicGuidedHints()
 
     def process_page(
         self,
@@ -33,42 +20,88 @@ class ColorizationOrchestrator:
         page_path: Path,
         reference_paths: list[Path],
         output_dir: Path,
-        metadata: dict[str, Any] | None = None,
+        style: str | StylePreset = "neutral",
+        fidelity: float | None = None,
     ) -> Path:
         img_bgr = cv2.imread(str(page_path), cv2.IMREAD_COLOR)
         if img_bgr is None:
-            raise FileNotFoundError(f"Imposible leer la imagen en {page_path}")
+            raise ValueError(f"No se pudo cargar la imagen: {page_path}")
 
-        refs_bgr: list[np.ndarray] = []
-        for ref_p in reference_paths:
-            ref = cv2.imread(str(ref_p), cv2.IMREAD_COLOR)
-            if ref is not None:
-                refs_bgr.append(ref)
+        refs_bgr = [cv2.imread(str(p), cv2.IMREAD_COLOR) for p in reference_paths]
+        refs_bgr = [r for r in refs_bgr if r is not None]
+        primary_ref = refs_bgr[0] if refs_bgr else None
 
-        try:
-            colorized = self._colorizer.colorize_page(
-                img_bgr,
-                reference_images=refs_bgr,
-                steps=settings.MANGANINJA_STEPS,
-            )
-        finally:
-            self._colorizer.unload()
+        raw_colorized = self._colorizer.colorize_page(
+            img_bgr,
+            reference_images=refs_bgr or None,
+            hint_points=None,
+        )
+        if raw_colorized is None:
+            raise ValueError(f"El colorizador no genero una imagen para: {page_path}")
 
-        # TEST DE AISLAMIENTO: Guardar salida directa de la IA
-        cv2.imwrite(str(output_dir / "debug_raw_ia.png"), colorized)
+        raw_path = output_dir / f"raw_{page_idx:04d}.png"
+        cv2.imwrite(str(raw_path), raw_colorized)
 
-        # Solo fusionar tinta negra original sobre el color
-        processed = self._postprocessor.process(colorized, img_bgr)
+        preset_obj = get_style(style) if isinstance(style, str) else style
+        postprocessor = PostProcessor(style=preset_obj)
+        processed = postprocessor.process(
+            colorized=raw_colorized,
+            original_gray=img_bgr,
+            reference_bgr=primary_ref,
+            fidelity=fidelity,
+        )
 
         if self._upscaler is not None:
-            try:
-                processed = self._upscaler.upscale(processed)
-            finally:
-                self._upscaler.unload()
+            processed = self._upscaler.upscale(processed)
 
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # La imagen original de inferencia debe ser .png
         out_path = output_dir / f"colored_{page_idx:04d}.png"
-        if not cv2.imwrite(str(out_path), processed):
-            raise OSError(f"Fallo al guardar la imagen procesada en {out_path}")
+        cv2.imwrite(str(out_path), processed)
+        return out_path
 
+    def reprocess_page(
+        self,
+        page_idx: int,
+        page_path: Path,
+        output_dir: Path,
+        primary_ref_path: Path | None,
+        style: str | StylePreset = "neutral",
+        fidelity: float | None = None,
+    ) -> Path:
+        """Aplica postprocesado en CPU sobre la salida cruda ya generada sin tocar la GPU."""
+        raw_path = output_dir / f"raw_{page_idx:04d}.png"
+        if not raw_path.is_file():
+            raw_path = output_dir / f"raw_{page_idx:04d}.webp"
+        if not raw_path.is_file():
+            raise FileNotFoundError(
+                f"Salida cruda no disponible para pagina {page_idx}"
+            )
+
+        raw_colorized = cv2.imread(str(raw_path), cv2.IMREAD_COLOR)
+
+        img_bgr = cv2.imread(str(page_path), cv2.IMREAD_COLOR)
+        if raw_colorized is None:
+            raise ValueError(f"No se pudo cargar la salida cruda: {raw_path}")
+        if img_bgr is None:
+            raise ValueError(f"No se pudo cargar la imagen: {page_path}")
+        primary_ref = (
+            cv2.imread(str(primary_ref_path), cv2.IMREAD_COLOR)
+            if primary_ref_path and primary_ref_path.is_file()
+            else None
+        )
+
+        preset_obj = get_style(style) if isinstance(style, str) else style
+        postprocessor = PostProcessor(style=preset_obj)
+        processed = postprocessor.process(
+            colorized=raw_colorized,
+            original_gray=img_bgr,
+            reference_bgr=primary_ref,
+            fidelity=fidelity,
+        )
+
+        if self._upscaler is not None:
+            processed = self._upscaler.upscale(processed)
+
+        out_path = output_dir / f"colored_{page_idx:04d}.png"
+        cv2.imwrite(str(out_path), processed)
         return out_path

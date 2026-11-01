@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rika Mangas — Color Engine</title>
+    <link rel="stylesheet" href="/static/css/main.css">
+</head>
+<body>
+    <header class="app-header">
+        <div class="brand">
+            <button type="button" id="btn-toggle-sidebar" class="sidebar-toggle" aria-label="Alternar panel lateral" title="Ocultar barra lateral (Cmd/Ctrl + B)">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                    <line x1="9" y1="3" x2="9" y2="21"></line>
+                </svg>
+            </button>
+            <span class="brand-title">Rika Mangas</span>
+            <span class="brand-badge">Offline · 6GB Target</span>
+        </div>
+
+        <div class="engine-status" id="engine-status-pill" aria-live="polite">
+            <span id="status-dot" class="status-dot"></span>
+            <span id="engine-status-text">Listo</span>
+        </div>
+    </header>
+
+    <main class="workspace-grid">
+        <aside class="sidebar" aria-label="Controles del estudio">
+            <!-- 1. Entrada -->
+            <section class="card" id="card-input">
+                <span class="card-title">1. Entrada</span>
+                
+                <div class="field">
+                    <label for="input-pages">Páginas B&amp;N</label>
+                    <div class="file-dropzone" id="zone-pages" role="button" tabindex="0" aria-label="Zona para arrastrar o seleccionar páginas en blanco y negro">
+                        <span id="label-pages">Hacer clic o arrastrar páginas (PNG / JPG)</span>
+                    </div>
+                    <input type="file" id="input-pages" multiple accept="image/png, image/jpeg">
+                </div>
+                
+                <div class="field">
+                    <label for="input-refs">Referencias (Opcional)</label>
+                    <div class="file-dropzone" id="zone-refs" role="button" tabindex="0" aria-label="Zona para arrastrar o seleccionar referencias de color">
+                        <span id="label-refs">Hacer clic o arrastrar referencias</span>
+                    </div>
+                    <input type="file" id="input-refs" multiple accept="image/png, image/jpeg">
+                </div>
+
+                <div class="field">
+                    <label for="style-selector" class="style-label">
+                        <span class="label-text">Estilo Base</span>
+                        <span class="badge-tag">Presets</span>
+                    </label>
+                    <div class="select-wrapper">
+                        <select id="style-selector" class="custom-select" aria-label="Seleccionar estilo base">
+                            <option value="neutral" selected>Neutral (Por defecto)</option>
+                        </select>
+                        <span class="select-chevron" aria-hidden="true">▾</span>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="fidelity-slider">
+                        <span>Fidelidad Inicial</span>
+                        <span id="fidelity-val" class="val-indicator">0.80</span>
+                    </label>
+                    <input type="range" id="fidelity-slider" min="0.0" max="1.0" step="0.05" value="0.80">
+                </div>
+
+                <button type="button" id="btn-upload" class="btn btn-primary">Cargar Lote</button>
+            </section>
+
+            <!-- 2. Procesamiento -->
+            <section class="card" id="card-execution" hidden>
+                <span class="card-title">2. Inferencia</span>
+                <button type="button" id="btn-start" class="btn btn-primary">Iniciar Colorización</button>
+                <div class="progress-wrap" id="progress-container" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                    <div class="progress-rail">
+                        <div id="progress-track" class="progress-track"></div>
+                    </div>
+                    <span id="progress-text" class="progress-status" aria-live="polite">En cola...</span>
+                </div>
+                <a id="btn-download" class="btn btn-secondary" hidden download>Descargar Archivo (.ZIP)</a>
+                <button type="button" id="btn-reset" class="btn btn-secondary" hidden>Nuevo Lote</button>
+            </section>
+
+            <!-- 3. Retoque Interactivo y Ajuste Dinámico de Estilo -->
+            <section class="card" id="card-touchup" hidden>
+                <span class="card-title">3. Ajustes y Retoque</span>
+                
+                <div class="field">
+                    <label for="page-selector">Página Activa</label>
+                    <div class="select-wrapper">
+                        <select id="page-selector" class="custom-select" aria-label="Seleccionar página activa"></select>
+                        <span class="select-chevron" aria-hidden="true">▾</span>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="tune-style-selector">Estilo en Vivo</label>
+                    <div class="select-wrapper">
+                        <select id="tune-style-selector" class="custom-select" aria-label="Ajustar estilo en vivo"></select>
+                        <span class="select-chevron" aria-hidden="true">▾</span>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="tune-fidelity-slider">
+                        <span>Fidelidad en Vivo</span>
+                        <span id="tune-fidelity-val" class="val-indicator">0.80</span>
+                    </label>
+                    <input type="range" id="tune-fidelity-slider" min="0.0" max="1.0" step="0.05" value="0.80">
+                </div>
+
+                <div class="field">
+                    <label>Bote de Pintura (LAB)</label>
+                    <div class="color-input-wrapper">
+                        <input type="color" id="color-picker" value="#f0c8a0" aria-label="Color de retoque">
+                        <span id="color-hex" class="color-hex-label">#F0C8A0</span>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="tolerance-slider">
+                        <span>Tolerancia</span>
+                        <span id="tolerance-val" class="val-indicator">18</span>
+                    </label>
+                    <input type="range" id="tolerance-slider" min="5" max="50" value="18">
+                </div>
+
+                <div class="btn-row">
+                    <button type="button" id="btn-undo" class="btn btn-secondary">Deshacer</button>
+                </div>
+            </section>
+        </aside>
+
+        <!-- Lienzo Viewport -->
+        <section class="viewport" aria-label="Lienzo de visualización">
+            <div class="viewport-toolbar">
+                <span id="viewport-resolution">0 × 0 px</span>
+                <div class="toolbar-group">
+                    <button type="button" id="btn-compare-original" class="hud-btn" hidden title="Mantén presionado o pulsa Espacio para alternar B&amp;N original">
+                        Comparar B&amp;N
+                    </button>
+                    <span id="viewport-coords">X: 0 | Y: 0</span>
+                </div>
+            </div>
+            <div class="canvas-container">
+                <div class="canvas-frame">
+                    <canvas id="view-canvas"></canvas>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Región para notificaciones flotantes tipo macOS HUD -->
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+
+    <script type="module" src="/static/js/main.js"></script>
+</body>
+</html>

@@ -28,8 +28,8 @@ class Settings(BaseSettings):
     MANGANINJA_WEIGHTS_DIR: Path = WEIGHTS_DIR / "manganinja"
     ESRGAN_WEIGHTS_PATH: Path = WEIGHTS_DIR / "RealESRGAN_x4plus_anime_6B.pth"
 
-    TEMPLATES_DIR: Path = BASE_DIR / "presentation" / "api" / "web" / "templates"
-    STATIC_DIR: Path = BASE_DIR / "presentation" / "api" / "web"
+    TEMPLATES_DIR: Path = BASE_DIR / "presentation" / "web" / "static" / "templates"
+    STATIC_DIR: Path = BASE_DIR / "presentation" / "web" / "static"
 
     MAX_IMAGE_PIXELS: int = 20_000_000
     MAX_DIMENSION: int = 4096

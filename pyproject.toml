@@ -15,6 +15,7 @@ dependencies = [
     "fastapi>=0.115.6",
     "jinja2>=3.1.4",
     "numpy>=2.0.0",
+    "opencv-contrib-python-headless>=5.0.0.93",
     "opencv-python>=4.10.0",
     "pillow>=11.0.0",
     "pydantic>=2.10.0",
@@ -36,7 +37,7 @@ mypy_path = "src"
 explicit_package_bases = true
 
 [tool.ruff]
-line-length = 135
+line-length = 88
 
 [[tool.uv.index]]
 name = "pytorch-cu124"

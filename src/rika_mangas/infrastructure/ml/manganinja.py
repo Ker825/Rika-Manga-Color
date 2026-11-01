@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import gc
 import logging
+from contextlib import suppress
 from typing import Any, cast
 
 import cv2
@@ -10,7 +13,6 @@ from diffusers import (
     AutoencoderKL,
     ControlNetModel,
     DPMSolverMultistepScheduler,
-    UNet2DConditionModel,
 )
 from transformers import (
     CLIPImageProcessor,
@@ -19,27 +21,71 @@ from transformers import (
 
 from rika_mangas.config import settings
 from rika_mangas.domain.ports.ports import HintPoint, IColorizerEngine
-from rika_mangas.infrastructure.ml.hooks import MangaNinjaAttnProcessor2_0, ReferenceFeatureBank
-from rika_mangas.infrastructure.security import safe_load_checkpoint
+from rika_mangas.infrastructure.ml.hooks import ReferenceAttentionControl
+from rika_mangas.infrastructure.ml.models.refunet_2d_condition import (
+    RefUNet2DConditionModel,
+)
+from rika_mangas.infrastructure.ml.models.unet_2d_condition import (
+    UNet2DConditionModel,
+)
+from rika_mangas.infrastructure.ml.point_manager import PointManager
+from rika_mangas.infrastructure.ml.point_network import PointNet
+from rika_mangas.infrastructure.ml.reference_manager import ReferenceManager
+from rika_mangas.infrastructure.ml.weight_loader import load_model_weights
 
 logger = logging.getLogger("rika_mangas.manganinja")
 
 
+def _move_to(
+    module: Any,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+) -> Any:
+    """Traslada submódulos a GPU/CPU de manera segura sorteando decoradores dinámicos."""
+    if module is None:
+        return None
+    if device is not None and dtype is not None:
+        return nn.Module.to(module, device, dtype=dtype)
+    if device is not None:
+        return nn.Module.to(module, device)
+    if dtype is not None:
+        return nn.Module.to(module, dtype=dtype)
+    return module
+
+
 class MangaNinjaStagedColorizer(IColorizerEngine):
-    scheduler: Any
-    vae: Any
-    image_encoder: Any
-    clip_proc: Any
-    denoising_unet: Any
-    reference_unet: Any
-    controlnet: Any
+    """Motor de colorización guiada MangaNinja optimizado para GPUs de 6GB VRAM.
+
+    Aplica una arquitectura desacoplada SOLID:
+    - ReferenceManager para selección y preparación de referencia cromática.
+    - PointManager para rasterización y embedding multiescala de pistas espaciales.
+    - ReferenceAttentionControl para mutual self-attention con desacoplamiento K/V.
+    - Gestión de memoria por etapas (Staged VRAM) para mantener la memoria activa bajo 6GB.
+    """
+
+    RGB_LATENT_SCALE_FACTOR: float = 0.18215
+
+    device: torch.device
+    dtype: torch.dtype
+    _loaded: bool
+    scheduler: Any | None
+    vae: Any | None
+    image_encoder: Any | None
+    clip_proc: CLIPImageProcessor | None
+    denoising_unet: UNet2DConditionModel | None
+    reference_unet: RefUNet2DConditionModel | None
+    controlnet: Any | None
+    point_net: PointNet | None
+    uncond_embed: torch.Tensor | None
 
     def __init__(self) -> None:
         target_device = getattr(settings, "TORCH_DEVICE", "cuda")
-        self.device = torch.device(target_device if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            target_device if torch.cuda.is_available() else "cpu"
+        )
         self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
-        self.bank = ReferenceFeatureBank()
         self._loaded = False
+
         self.scheduler = None
         self.vae = None
         self.image_encoder = None
@@ -47,13 +93,17 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
         self.denoising_unet = None
         self.reference_unet = None
         self.controlnet = None
+        self.point_net = None
+        self.uncond_embed = None
 
     def load(self) -> None:
+        """Carga y valida todos los pesos requeridos para el pipeline offline."""
         if self._loaded:
             return
 
-        logger.info("Inicializando componentes base de MangaNinja...")
+        logger.info("Cargando componentes nativos de MangaNinja...")
 
+        # 1. Scheduler DPMSolver++ optimizado para fidelidad de color
         sched_raw: Any = DPMSolverMultistepScheduler.from_pretrained(
             str(settings.SD_15_LOCAL_DIR),
             subfolder="scheduler",
@@ -63,227 +113,401 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
         )
         self.scheduler = sched_raw[0] if isinstance(sched_raw, tuple) else sched_raw
 
+        # 2. VAE con soporte de tiling para baja memoria
         vae_model = AutoencoderKL.from_pretrained(
             str(settings.SD_15_LOCAL_DIR),
             subfolder="vae",
             torch_dtype=self.dtype,
             local_files_only=True,
         )
-        self.vae = vae_model
-        self.vae.enable_tiling()
-        self.vae.enable_slicing()
+        vae_any: Any = vae_model
+        vae_any.enable_tiling()
+        vae_any.enable_slicing()
+        self.vae = vae_any
 
-        self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+        # 3. CLIP Image Encoder y Preprocesador
+        clip_encoder = CLIPVisionModelWithProjection.from_pretrained(
             str(settings.CLIP_LOCAL_DIR),
             torch_dtype=self.dtype,
             local_files_only=True,
         )
+        self.image_encoder = clip_encoder
         self.clip_proc = CLIPImageProcessor.from_pretrained(
             str(settings.CLIP_LOCAL_DIR),
             local_files_only=True,
         )
 
-        unet_config = UNet2DConditionModel.load_config(
-            str(settings.SD_15_LOCAL_DIR),
-            subfolder="unet",
-            local_files_only=True,
+        # 4. Vector estático incondicional precalculado
+        self.uncond_embed = torch.load(
+            settings.MANGANINJA_WEIGHTS_DIR / "uncond_embed.pt",
+            map_location="cpu",
+            weights_only=True,
+        ).to(dtype=self.dtype)
+
+        # 5. UNet Denoising
+        denoising = UNet2DConditionModel(
+            in_channels=4,
+            out_channels=4,
+            block_out_channels=(320, 640, 1280, 1280),
+            layers_per_block=2,
+            cross_attention_dim=768,
+            attention_head_dim=8,
         )
-        self.denoising_unet = UNet2DConditionModel.from_config(unet_config).to(dtype=self.dtype)
-        denoise_w = safe_load_checkpoint(settings.MANGANINJA_WEIGHTS_DIR / "denoising_unet.pth")
-        self.denoising_unet.load_state_dict(denoise_w, strict=False)
+        load_model_weights(
+            denoising,
+            settings.MANGANINJA_WEIGHTS_DIR / "denoising_unet.pth",
+            ignore_output_layers=False,
+        )
+        _move_to(denoising, dtype=self.dtype)
+        self.denoising_unet = denoising
 
-        self.reference_unet = UNet2DConditionModel.from_config(unet_config).to(dtype=self.dtype)
-        ref_w = safe_load_checkpoint(settings.MANGANINJA_WEIGHTS_DIR / "reference_unet.pth")
-        self.reference_unet.load_state_dict(ref_w, strict=False)
+        # 6. UNet Reference
+        reference = RefUNet2DConditionModel(
+            in_channels=4,
+            block_out_channels=(320, 640, 1280, 1280),
+            layers_per_block=2,
+            cross_attention_dim=768,
+            attention_head_dim=8,
+        )
+        load_model_weights(
+            reference,
+            settings.MANGANINJA_WEIGHTS_DIR / "reference_unet.pth",
+            ignore_output_layers=True,
+        )
+        _move_to(reference, dtype=self.dtype)
+        self.reference_unet = reference
 
+        # 7. ControlNet (Lineart)
         ctrl_config = ControlNetModel.load_config(
             str(settings.CONTROLNET_LINEART_LOCAL_DIR),
             local_files_only=True,
         )
-        self.controlnet = ControlNetModel.from_config(ctrl_config).to(dtype=self.dtype)
-        ctrl_w = safe_load_checkpoint(settings.MANGANINJA_WEIGHTS_DIR / "controlnet.pth")
-        self.controlnet.load_state_dict(ctrl_w, strict=False)
+        ctrl_model = ControlNetModel.from_config(ctrl_config)
+        load_model_weights(
+            ctrl_model,
+            settings.MANGANINJA_WEIGHTS_DIR / "controlnet.pth",
+            ignore_output_layers=False,
+        )
+        ctrl_any: Any = ctrl_model
+        _move_to(ctrl_any, dtype=self.dtype)
+        self.controlnet = ctrl_any
 
-        for name, module in self.denoising_unet.named_modules():
-            if module.__class__.__name__ == "Attention" and name.endswith(".attn1"):
-                set_p = getattr(module, "set_processor", None)
-                if callable(set_p):
-                    set_p(MangaNinjaAttnProcessor2_0(name, self.bank))
+        # 8. PointNet
+        point_net = PointNet(
+            conditioning_channels=1,
+            out_channels=(320, 640, 1280, 1280),
+            downsamples=(6, 2, 2, 2),
+        )
+        load_model_weights(
+            point_net,
+            settings.MANGANINJA_WEIGHTS_DIR / "point_net.pth",
+            ignore_output_layers=False,
+        )
+        _move_to(point_net, dtype=self.dtype)
+        self.point_net = point_net
 
         self._loaded = True
-        logger.info("Modelos cargados correctamente.")
+        logger.info("MangaNinja inicializado correctamente.")
 
-    @staticmethod
-    def _calculate_chroma(img_bgr: np.ndarray) -> float:
-        lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-        a = lab[:, :, 1] - 128.0
-        b = lab[:, :, 2] - 128.0
-        return float(np.sqrt(a * a + b * b).mean())
+    def _prepare_canvas(
+        self, image_bgr: np.ndarray, size: int
+    ) -> tuple[int, int, int, int, np.ndarray]:
+        """Calcula dimensiones escaladas a múltiplos exactos de 64 sin bandas de padding."""
+        orig_h, orig_w = image_bgr.shape[:2]
+        scale = min(size / max(orig_h, orig_w), 1.0)
+        pad_w = max(64, round(orig_w * scale / 64) * 64)
+        pad_h = max(64, round(orig_h * scale / 64) * 64)
 
-    def _select_reference(self, refs: list[np.ndarray]) -> np.ndarray:
-        if not refs:
-            raise ValueError("No se proporcionaron imagenes de referencia")
-        if len(refs) == 1:
-            return refs[0]
-        return max(refs, key=self._calculate_chroma)
+        img_resized = cv2.resize(
+            image_bgr, (pad_w, pad_h), interpolation=cv2.INTER_AREA
+        )
+        return orig_w, orig_h, pad_w, pad_h, img_resized
 
-    @torch.inference_mode()
+    def _prepare_lineart_condition(
+        self, img_padded: np.ndarray, denoise_sigma: int = 0
+    ) -> torch.Tensor:
+        """Extrae y normaliza el mapa de lineart según el protocolo nativo de MangaNinja."""
+        gray_u8 = cv2.cvtColor(img_padded, cv2.COLOR_BGR2GRAY)
+        if denoise_sigma > 0:
+            # Suavizado bilateral ligero que atenúa micro-tramas preservando trazos
+            gray_u8 = cv2.bilateralFilter(gray_u8, d=5, sigmaColor=float(denoise_sigma), sigmaSpace=3.0)
+        # ControlNet lineart requiere líneas BLANCAS (1.0) sobre fondo NEGRO (0.0).
+        # El manga original tiene tinta negra sobre papel blanco, por lo que debe invertirse.
+        lines = 1.0 - (gray_u8.astype(np.float32) / 255.0)
+        edge = (
+            torch.from_numpy(lines)
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(device=self.device, dtype=self.dtype)
+        )
+        # Umbralización para eliminar ruido de tramas suaves dejando fondo negro limpio
+        edge[edge <= 0.20] = 0.0
+        # Normalización [-1.0, 1.0] con 3 canales para ControlNet
+        return edge.repeat(1, 3, 1, 1) * 2.0 - 1.0
+
     def colorize_page(
         self,
         image_bgr: np.ndarray,
         *,
         reference_images: list[np.ndarray] | None = None,
         size: int = 768,
-        steps: int = 16,
+        steps: int = 20,
         denoise_sigma: int = 15,
         tiled: bool = False,
         tile_size: int = 768,
         tile_overlap: int = 96,
         hint_points: list[HintPoint] | None = None,
+        guidance_scale_ref: float = 6.0,
+        guidance_scale_point: float = 10.0,
         **kwargs: Any,
     ) -> np.ndarray:
-        self.load()
+        """Ejecuta el ciclo de colorización completa por difusión con mutual attention."""
+        with torch.inference_mode():
+            self.load()
 
-        orig_h, orig_w = image_bgr.shape[:2]
+            if (
+                self.scheduler is None
+                or self.vae is None
+                or self.image_encoder is None
+                or self.clip_proc is None
+                or self.denoising_unet is None
+                or self.reference_unet is None
+                or self.controlnet is None
+                or self.point_net is None
+                or self.uncond_embed is None
+            ):
+                raise RuntimeError("Componentes de MangaNinja no inicializados.")
 
-        # 1. Escalar manteniendo aspect ratio al tamaño de trabajo (lado mayor <= size)
-        scale = min(size / max(orig_h, orig_w), 1.0)
-        work_w = int(orig_w * scale)
-        work_h = int(orig_h * scale)
+            orig_w, orig_h, work_w, work_h, img_padded = self._prepare_canvas(
+                image_bgr, size
+            )
+            pad_h, pad_w = img_padded.shape[:2]
 
-        # Alinear a múltiplos de 64 para VAE / UNet
-        pad_w = max(64, (work_w + 63) // 64 * 64)
-        pad_h = max(64, (work_h + 63) // 64 * 64)
-
-        img_resized = cv2.resize(image_bgr, (work_w, work_h), interpolation=cv2.INTER_AREA)
-        img_padded = cv2.copyMakeBorder(img_resized, 0, pad_h - work_h, 0, pad_w - work_w, cv2.BORDER_REFLECT_101)
-        img_rgb = cv2.cvtColor(img_padded, cv2.COLOR_BGR2RGB)
-
-        if reference_images:
-            ref_bgr = self._select_reference(reference_images)
-            ref_resized = cv2.resize(ref_bgr, (pad_w, pad_h), interpolation=cv2.INTER_AREA)
-        else:
-            # Si no hay referencia, usar lienzo neutro balanceado (evita colapso a sepia)
-            ref_resized = np.full((pad_h, pad_w, 3), 128, dtype=np.uint8)
-
-        ref_rgb = cv2.cvtColor(ref_resized, cv2.COLOR_BGR2RGB)
-
-        try:
-            # SUB-ETAPA A: Codificación VAE / CLIP
-            self.vae.to(self.device)
-            nn.Module.to(self.image_encoder, self.device)
-
-            ref_tensor = torch.from_numpy(ref_rgb).permute(2, 0, 1).unsqueeze(0).to(self.device, dtype=self.dtype) / 127.5 - 1.0
-            vae_cfg = self.vae.config
-            scale_fac = float(
-                vae_cfg.get("scaling_factor", 0.18215) if isinstance(vae_cfg, dict) else getattr(vae_cfg, "scaling_factor", 0.18215)
+            # 1. Selección y acondicionamiento de la imagen de referencia
+            ref_bgr = ReferenceManager.select_best_reference(
+                reference_images, (pad_h, pad_w)
+            )
+            ref_rgb, ref_tensor = ReferenceManager.prepare_reference_tensor(
+                ref_bgr, pad_w, pad_h, device=self.device, dtype=self.dtype
             )
 
+            # 2. Codificación VAE y CLIP de la referencia (VRAM Staged)
+            _move_to(self.vae, self.device)
             vae_out: Any = self.vae.encode(ref_tensor)
-            dist = getattr(vae_out, "latent_dist", vae_out[0] if isinstance(vae_out, tuple) else vae_out)
-            ref_latents = dist.sample() * scale_fac
+            dist = (vae_out[0] if isinstance(vae_out, tuple) else vae_out).latent_dist
+            ref_latents = dist.sample() * self.RGB_LATENT_SCALE_FACTOR
+            _move_to(self.vae, "cpu")
 
+            _move_to(self.image_encoder, self.device)
             clip_inputs: Any = self.clip_proc(images=ref_rgb, return_tensors="pt")
-            pixel_vals = cast(torch.Tensor, clip_inputs["pixel_values"]).to(self.device, dtype=self.dtype)
-            img_out: Any = self.image_encoder(pixel_values=pixel_vals)
-            image_embeds = img_out.image_embeds.unsqueeze(1)
-
-            self.vae.to("cpu")
-            nn.Module.to(self.image_encoder, "cpu")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            # SUB-ETAPA B: Extracción de Características de Referencia
-            self.bank.remove_hooks()
-            for name, module in self.reference_unet.named_modules():
-                if module.__class__.__name__ == "Attention" and name.endswith(".attn1"):
-                    self.bank.register(module, name)
-
-            self.reference_unet.to(self.device)
-            zero_t = torch.zeros(1, device=self.device, dtype=torch.long)
-            self.reference_unet(
-                ref_latents.to(self.device),
-                timestep=zero_t,
-                encoder_hidden_states=image_embeds.to(self.device),
-                return_dict=False,
+            pixel_vals = cast(torch.Tensor, clip_inputs["pixel_values"]).to(
+                self.device, dtype=self.dtype
             )
-            self.reference_unet.to("cpu")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            img_out: Any = self.image_encoder(pixel_values=pixel_vals)
+            ref_embeds = img_out.image_embeds.unsqueeze(1)
+            _move_to(self.image_encoder, "cpu")
 
-            # SUB-ETAPA C: Bucle de Denoising con CFG
-            self.controlnet.to(self.device)
-            self.denoising_unet.to(self.device)
+            uncond_embeds = self.uncond_embed.to(device=self.device, dtype=self.dtype)
 
-            # 1. Lineart invertido (Fondo=0, Línea=1) para ControlNet
-            gray = cv2.cvtColor(img_padded, cv2.COLOR_BGR2GRAY)
-            lineart_inv = np.clip((255.0 - cv2.bilateralFilter(gray, 5, 50, 50)) / 255.0, 0.0, 1.0)
-            cond_np = np.repeat(lineart_inv[:, :, np.newaxis], 3, axis=2)
-            cond_tensor = torch.from_numpy(cond_np).permute(2, 0, 1).unsqueeze(0).to(self.device, dtype=self.dtype)
+            # 3. Determinación de CFG (3-vías con puntos, 2-vías sin puntos)
+            has_points = bool(hint_points and len(hint_points) > 0)
+            point_ref_embs: list[torch.Tensor] | None = None
+            point_main_embs: list[torch.Tensor] | None = None
 
-            # 2. CFG: Duplicar tensores (uncond, cond)
-            cond_tensor = torch.cat([cond_tensor, cond_tensor], dim=0)
-            uncond_embeds = torch.zeros_like(image_embeds)
-            image_embeds_cfg = torch.cat([uncond_embeds, image_embeds], dim=0)
+            if has_points:
+                num_cfg = 3
+                point_mask_main = PointManager.generate_point_mask(
+                    hint_points, pad_w, pad_h, self.device, self.dtype
+                )
+                point_mask_ref = torch.zeros(
+                    (1, 1, pad_h, pad_w), device=self.device, dtype=self.dtype
+                )
+                _move_to(self.point_net, self.device)
+                point_main_embs = PointManager.encode_points(
+                    self.point_net, point_mask_main
+                )
+                point_ref_embs = PointManager.encode_points(
+                    self.point_net, point_mask_ref
+                )
+                _move_to(self.point_net, "cpu")
 
-            latents_shape = (1, 4, pad_h // 8, pad_w // 8)
-            latents = torch.randn(latents_shape, device=self.device, dtype=self.dtype)
-
-            self.scheduler.set_timesteps(steps, device=self.device)
-            latents = latents * self.scheduler.init_noise_sigma
-            guidance_scale = 2.0
-
-            for t in self.scheduler.timesteps:
-                # Expandir latentes para batch=2
-                latent_model_input = torch.cat([latents] * 2)
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
-                ctrl_out: Any = self.controlnet(
-                    latent_model_input,
-                    timestep=t,
-                    encoder_hidden_states=image_embeds_cfg,
-                    controlnet_cond=cond_tensor,
-                    conditioning_scale=0.35,  # Bajado para priorizar inyección de color
-                    return_dict=False,
+                cfg_encoder_hidden_states = torch.cat(
+                    [uncond_embeds, ref_embeds, ref_embeds], dim=0
+                )
+            else:
+                num_cfg = 2
+                cfg_encoder_hidden_states = torch.cat(
+                    [uncond_embeds, ref_embeds], dim=0
                 )
 
-                unet_out: Any = self.denoising_unet(
-                    latent_model_input,
-                    timestep=t,
-                    encoder_hidden_states=image_embeds_cfg,
-                    down_block_additional_residuals=ctrl_out[0],
-                    mid_block_additional_residual=ctrl_out[1],
-                    return_dict=False,
+            # 4. Configuración de hooks de Mutual Self-Attention
+            writer: ReferenceAttentionControl | None = None
+            reader: ReferenceAttentionControl | None = None
+
+            try:
+                writer = ReferenceAttentionControl(
+                    self.reference_unet,
+                    mode="write",
+                    do_classifier_free_guidance=False,
+                    fusion_blocks="full",
+                )
+                reader = ReferenceAttentionControl(
+                    self.denoising_unet,
+                    mode="read",
+                    do_classifier_free_guidance=True,
+                    fusion_blocks="full",
                 )
 
-                # 3. Calcular CFG
-                noise_pred_uncond, noise_pred_text = unet_out[0].chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                # 5. Paso 0: Extracción de características de referencia en Reference UNet
+                _move_to(self.reference_unet, self.device)
+                zero_timestep = torch.zeros((1,), dtype=torch.long, device=self.device)
+                self.reference_unet(
+                    ref_latents,
+                    zero_timestep,
+                    encoder_hidden_states=ref_embeds,
+                    return_dict=False,
+                )
+                # Copiar banco del escritor al lector e inyectar embeddings espaciales
+                reader.update(
+                    writer,
+                    point_embedding_ref=point_ref_embs,
+                    point_embedding_main=point_main_embs,
+                    dtype=self.dtype,
+                )
+                # Liberar Reference UNet de VRAM para mantener presupuesto de 6GB
+                _move_to(self.reference_unet, "cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                # 6. Preparación de lineart y latentes de partida
+                edge_cond = self._prepare_lineart_condition(img_padded, denoise_sigma)
+                cfg_cond_tensor = edge_cond.repeat(num_cfg, 1, 1, 1)
 
-            # SUB-ETAPA D: Decodificación VAE Final
-            self.vae.to(self.device)
-            latents_scaled = latents / scale_fac
-            dec_out: Any = self.vae.decode(latents_scaled, return_dict=False)
-            decoded = dec_out[0] if isinstance(dec_out, tuple) else getattr(dec_out, "sample", dec_out)
-            self.vae.to("cpu")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                latents = torch.randn(
+                    (1, 4, pad_h // 8, pad_w // 8),
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                self.scheduler.set_timesteps(steps, device=self.device)
+                latents = latents * self.scheduler.init_noise_sigma
 
-            out_img = ((decoded.clamp(-1.0, 1.0) + 1.0) * 127.5).squeeze(0).permute(1, 2, 0)
-            out_np = out_img.round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            out_bgr = cv2.cvtColor(out_np, cv2.COLOR_RGB2BGR)
-            colored_work = out_bgr[:work_h, :work_w]
-            return cv2.resize(colored_work, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+                # 7. Ciclo de difusión (Denoising Loop)
+                _move_to(self.controlnet, self.device)
+                _move_to(self.denoising_unet, self.device)
 
-        finally:
-            self.bank.clear()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                for t in self.scheduler.timesteps:
+                    latent_model_input = latents.repeat(num_cfg, 1, 1, 1)
+                    latent_model_input = self.scheduler.scale_model_input(
+                        latent_model_input, t
+                    )
+
+                    ctrl_out: Any = self.controlnet(
+                        latent_model_input,
+                        timestep=t,
+                        encoder_hidden_states=cfg_encoder_hidden_states,
+                        controlnet_cond=cfg_cond_tensor,
+                        conditioning_scale=1.0,
+                        return_dict=False,
+                    )
+                    down_res, mid_res = ctrl_out[0], ctrl_out[1]
+
+                    unet_out: Any = self.denoising_unet(
+                        latent_model_input,
+                        timestep=t,
+                        encoder_hidden_states=cfg_encoder_hidden_states,
+                        down_block_additional_residuals=down_res,
+                        mid_block_additional_residual=mid_res,
+                        return_dict=False,
+                    )
+                    pred_sample = unet_out[0]
+
+                    # 8. Predicción de ruido guiada por clasificador (CFG)
+                    if num_cfg == 3:
+                        noise_pred_uncond, noise_pred_ref, noise_pred_point = (
+                            pred_sample.chunk(3)
+                        )
+                        noise_pred_1 = noise_pred_uncond + guidance_scale_ref * (
+                            noise_pred_ref - noise_pred_uncond
+                        )
+                        noise_pred_2 = noise_pred_ref + guidance_scale_point * (
+                            noise_pred_point - noise_pred_ref
+                        )
+                        noise_pred = (noise_pred_1 + noise_pred_2) / 2.0
+                    else:
+                        noise_pred_uncond, noise_pred_ref = pred_sample.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale_ref * (
+                            noise_pred_ref - noise_pred_uncond
+                        )
+
+                    step_res: Any = self.scheduler.step(
+                        noise_pred, t, latents, return_dict=False
+                    )
+                    latents = (
+                        step_res[0]
+                        if isinstance(step_res, tuple)
+                        else step_res.prev_sample
+                    )
+                    latents = torch.clamp(latents, -4.5, 4.5)
+
+                # 9. Decodificación final de latentes con VAE
+                _move_to(self.controlnet, "cpu")
+                _move_to(self.denoising_unet, "cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                _move_to(self.vae, self.device)
+                latents_scaled = (latents / self.RGB_LATENT_SCALE_FACTOR).clamp(
+                    -12.0, 12.0
+                )
+                dec_out: Any = self.vae.decode(
+                    latents_scaled,
+                    return_dict=False,
+                )
+                decoded = (
+                    dec_out[0]
+                    if isinstance(dec_out, tuple)
+                    else getattr(dec_out, "sample", dec_out)
+                )
+
+                out_img = (
+                    ((decoded.clamp(-1.0, 1.0) + 1.0) * 127.5)
+                    .squeeze(0)
+                    .permute(1, 2, 0)
+                )
+                out_bgr = cv2.cvtColor(
+                    out_img.round().clamp(0, 255).to(torch.uint8).cpu().numpy(),
+                    cv2.COLOR_RGB2BGR,
+                )
+
+                # Deshacer padding y ajustar a la resolución nativa
+                unpadded = out_bgr[:work_h, :work_w]
+                return cv2.resize(
+                    unpadded, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4
+                )
+
+            finally:
+                if reader is not None:
+                    reader.remove_hooks()
+                if writer is not None:
+                    writer.remove_hooks()
+
+                for component in (
+                    self.denoising_unet,
+                    self.reference_unet,
+                    self.controlnet,
+                    self.vae,
+                    self.point_net,
+                    self.image_encoder,
+                ):
+                    if component is not None:
+                        with suppress(Exception):
+                            _move_to(component, "cpu")
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     def unload(self) -> None:
-        self.bank.remove_hooks()
+        """Libera todos los módulos y memoria de GPU/CPU."""
         if self._loaded:
             self.vae = None
             self.image_encoder = None
@@ -291,8 +515,11 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
             self.denoising_unet = None
             self.reference_unet = None
             self.controlnet = None
+            self.point_net = None
             self.scheduler = None
+            self.uncond_embed = None
             self._loaded = False
+
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

@@ -22,7 +22,9 @@ class PageChromaTransfer:
     sin modificar la luminancia (canal L).
     """
 
-    def __init__(self, clip_ratio_min: float = 0.75, clip_ratio_max: float = 1.35) -> None:
+    def __init__(
+        self, clip_ratio_min: float = 0.75, clip_ratio_max: float = 1.35
+    ) -> None:
         self.clip_min = clip_ratio_min
         self.clip_max = clip_ratio_max
         self._ref_mean_a: float | None = None
@@ -74,13 +76,29 @@ class PageChromaTransfer:
         src_std_b = float(np.std(b_vals)) or 1.0
 
         # Escalar dispersión restringida para evitar monocromatismo excesivo
-        a_scale = float(np.clip((self._ref_std_a or 1.0) / src_std_a, self.clip_min, self.clip_max))
+        a_scale = float(
+            np.clip((self._ref_std_a or 1.0) / src_std_a, self.clip_min, self.clip_max)
+        )
         a_shift = (self._ref_mean_a or 128.0) - src_mean_a * a_scale
-        lab[:, :, 1] += strength * (lab[:, :, 1] * (a_scale - 1.0) + a_shift)
+        l_chan = lab[:, :, 0]
+        tonal_weight = np.clip((l_chan - 25.0) / 25.0, 0.0, 1.0) * np.clip(
+            (245.0 - l_chan) / 20.0, 0.0, 1.0
+        )
+        lab[:, :, 1] += (
+            strength
+            * tonal_weight
+            * (lab[:, :, 1] * (a_scale - 1.0) + a_shift)
+        )
 
-        b_scale = float(np.clip((self._ref_std_b or 1.0) / src_std_b, self.clip_min, self.clip_max))
+        b_scale = float(
+            np.clip((self._ref_std_b or 1.0) / src_std_b, self.clip_min, self.clip_max)
+        )
         b_shift = (self._ref_mean_b or 128.0) - src_mean_b * b_scale
-        lab[:, :, 2] += strength * (lab[:, :, 2] * (b_scale - 1.0) + b_shift)
+        lab[:, :, 2] += (
+            strength
+            * tonal_weight
+            * (lab[:, :, 2] * (b_scale - 1.0) + b_shift)
+        )
 
         np.clip(lab, 0.0, 255.0, out=lab)
         return cast(np.ndarray, cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR))
@@ -116,14 +134,16 @@ class CharacterMemoryLAB:
 
         cv2_data = getattr(cv2, "data", None)
         if cv2_data is not None and hasattr(cv2_data, "haarcascades"):
-            candidates.append(Path(cv2_data.haarcascades) / "haarcascade_frontalface_default.xml")
+            candidates.append(
+                Path(cv2_data.haarcascades) / "haarcascade_frontalface_default.xml"
+            )
 
         cascade_path: Path | None = next((p for p in candidates if p.is_file()), None)
 
         if cascade_path is None:
             logger.warning(
                 "Clasificador 'haarcascade_frontalface_default.xml' no encontrado. "
-                "La memoria de personajes continuará en modo pasivo (sin detección facial)."
+                "La memoria de personajes continuará en modo pasivo (sin detección facial)."  # noqa: E501
             )
             return
 
@@ -135,7 +155,9 @@ class CharacterMemoryLAB:
             else:
                 logger.warning("Fallo al parsear el XML del clasificador Haar Cascade.")
 
-    def detect_faces(self, image_bgr: np.ndarray, max_edge: int = 1280) -> list[FaceBox]:
+    def detect_faces(
+        self, image_bgr: np.ndarray, max_edge: int = 1280
+    ) -> list[FaceBox]:
         """Detecta rostros escalando la imagen internamente para optimizar CPU."""
         detector = self._detector
         if detector is None:
@@ -227,7 +249,9 @@ class CharacterMemoryLAB:
             cloth_gray = cv2.cvtColor(cloth_bgr, cv2.COLOR_BGR2GRAY)
             cloth_mask = (cloth_gray > 30) & (cloth_gray < 240)
             if np.count_nonzero(cloth_mask) >= 16:
-                cloth_lab = np.mean(cloth_lab_roi[cloth_mask], axis=0).astype(np.float32)
+                cloth_lab = np.mean(cloth_lab_roi[cloth_mask], axis=0).astype(
+                    np.float32
+                )
 
         return skin_lab, hair_lab, cloth_lab
 
@@ -243,8 +267,16 @@ class CharacterMemoryLAB:
 
         for char in self.characters:
             d_skin = float(np.linalg.norm(skin_lab[1:] - char.skin_lab[1:]))
-            d_hair = float(np.linalg.norm(hair_lab[1:] - char.hair_lab[1:])) if hair_lab is not None else 0.0
-            d_cloth = float(np.linalg.norm(clothes_lab[1:] - char.clothes_lab[1:])) if clothes_lab is not None else 0.0
+            d_hair = (
+                float(np.linalg.norm(hair_lab[1:] - char.hair_lab[1:]))
+                if hair_lab is not None
+                else 0.0
+            )
+            d_cloth = (
+                float(np.linalg.norm(clothes_lab[1:] - char.clothes_lab[1:]))
+                if clothes_lab is not None
+                else 0.0
+            )
 
             total_dist = 0.50 * d_skin + 0.30 * d_hair + 0.20 * d_cloth
             if total_dist < min_dist:
@@ -255,9 +287,13 @@ class CharacterMemoryLAB:
             alpha = 1.0 / (best_char.n_observations + 1)
             best_char.skin_lab = (1.0 - alpha) * best_char.skin_lab + alpha * skin_lab
             if hair_lab is not None:
-                best_char.hair_lab = (1.0 - alpha) * best_char.hair_lab + alpha * hair_lab
+                best_char.hair_lab = (
+                    1.0 - alpha
+                ) * best_char.hair_lab + alpha * hair_lab
             if clothes_lab is not None:
-                best_char.clothes_lab = (1.0 - alpha) * best_char.clothes_lab + alpha * clothes_lab
+                best_char.clothes_lab = (
+                    1.0 - alpha
+                ) * best_char.clothes_lab + alpha * clothes_lab
             best_char.n_observations += 1
             best_char.last_seen_page = page_num
             return best_char
@@ -266,7 +302,9 @@ class CharacterMemoryLAB:
             cid=len(self.characters) + 1,
             skin_lab=skin_lab.copy(),
             hair_lab=hair_lab.copy() if hair_lab is not None else skin_lab.copy(),
-            clothes_lab=clothes_lab.copy() if clothes_lab is not None else skin_lab.copy(),
+            clothes_lab=clothes_lab.copy()
+            if clothes_lab is not None
+            else skin_lab.copy(),
             n_observations=1,
             last_seen_page=page_num,
         )
@@ -297,7 +335,16 @@ class CharacterMemoryLAB:
 
         # Máscara elíptica con desvanecimiento gaussiano
         mask = np.zeros((ch, cw), dtype=np.uint8)
-        cv2.ellipse(mask, (cw // 2, ch // 2), (int(cw * 0.45), int(ch * 0.50)), 0, 0, 360, 255, -1)
+        cv2.ellipse(
+            mask,
+            (cw // 2, ch // 2),
+            (int(cw * 0.45), int(ch * 0.50)),
+            0,
+            0,
+            360,
+            255,
+            -1,
+        )
         soft = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (15, 15), 0) * strength
 
         weights_sum = float(soft.sum())
@@ -310,7 +357,9 @@ class CharacterMemoryLAB:
             shift = (float(target_lab[c]) - region_mean) * soft
             roi[:, :, c] += shift
 
-    def observe_and_apply(self, image_bgr: np.ndarray, page_num: int, strength: float = 0.55) -> np.ndarray:
+    def observe_and_apply(
+        self, image_bgr: np.ndarray, page_num: int, strength: float = 0.55
+    ) -> np.ndarray:
         """Detecta rostros, actualiza la memoria y retonifica suavemente."""
         faces = self.detect_faces(image_bgr)
         if not faces:
@@ -319,14 +368,18 @@ class CharacterMemoryLAB:
         lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
         for face in faces:
-            skin_lab, hair_lab, cloth_lab = self._extract_signatures(image_bgr, lab, face)
+            skin_lab, hair_lab, cloth_lab = self._extract_signatures(
+                image_bgr, lab, face
+            )
             if skin_lab is None:
                 continue
 
             char = self._match_or_create(skin_lab, hair_lab, cloth_lab, page_num)
 
             # Re-tonificar piel
-            self._blend_preserving_shading(lab, (face.x, face.y, face.w, face.h), char.skin_lab, strength)
+            self._blend_preserving_shading(
+                lab, (face.x, face.y, face.w, face.h), char.skin_lab, strength
+            )
 
             # Re-tonificar ropa (si hay firma válida)
             if cloth_lab is not None:
@@ -336,7 +389,9 @@ class CharacterMemoryLAB:
                     int(face.w * 1.4),
                     int(face.h * 1.5),
                 )
-                self._blend_preserving_shading(lab, cloth_box, char.clothes_lab, strength * 0.6)
+                self._blend_preserving_shading(
+                    lab, cloth_box, char.clothes_lab, strength * 0.6
+                )
 
         np.clip(lab, 0.0, 255.0, out=lab)
         return cast(np.ndarray, cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR))

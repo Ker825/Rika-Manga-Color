@@ -15,3 +15,9 @@ pycache/
 
 # AI models and weights
 models/weights/
+
+storage/output/
+storage/output/*
+
+storage/uploads/
+storage/uploads/*

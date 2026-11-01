@@ -8,16 +8,9 @@ def _to_gray(image: np.ndarray) -> np.ndarray:
     return image
 
 
-def lineart_mask(gray: np.ndarray, low: int = 60, dilate: int = 0) -> np.ndarray:
-    g = _to_gray(gray)
-    mask = g <= low
-    if dilate > 0:
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dilate, dilate))
-        mask = cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
-    return mask
-
-
-def bubble_mask(gray: np.ndarray, white_thr: int = 245, min_area_ratio: float = 0.002) -> np.ndarray:
+def bubble_mask(
+    gray: np.ndarray, white_thr: int = 245, min_area_ratio: float = 0.002
+) -> np.ndarray:
     g = _to_gray(gray)
     h, w = g.shape[:2]
     page_area = h * w
@@ -43,60 +36,103 @@ def bubble_mask(gray: np.ndarray, white_thr: int = 245, min_area_ratio: float = 
         ww = stats[i, cv2.CC_STAT_WIDTH]
         hh = stats[i, cv2.CC_STAT_HEIGHT]
 
-        # Ignorar áreas que tocan el borde exterior
         if x <= 2 or y <= 2 or (x + ww) >= (w - 2) or (y + hh) >= (h - 2):
             continue
 
-        # Relación de aspecto: los bocadillos suelen ser ovalados o redondeados, no tiras delgadas
         aspect = ww / float(hh)
         if aspect < 0.4 or aspect > 2.5:
             continue
 
-        # Un bocadillo real de manga contiene texto oscuro en su interior
         roi = g[y : y + hh, x : x + ww]
         roi_mask = labels[y : y + hh, x : x + ww] == i
         text_pixels = np.count_nonzero((roi < 80) & roi_mask)
         ink_ratio = text_pixels / float(area)
 
-        # Si no contiene suficiente tinta interior, es piel o fondo, no un diálogo
         if ink_ratio > 0.015:
-            mask |= labels == i
+            mask[y : y + hh, x : x + ww] |= roi_mask
 
     return mask
 
 
-def gutter_mask(gray: np.ndarray, white_thr: int = 240, edge_band: float = 0.04) -> np.ndarray:
+def gutter_mask(
+    gray: np.ndarray, white_thr: int = 245, edge_band: float = 0.04
+) -> np.ndarray:
+    """Detecta únicamente márgenes exteriores continuos de papel blanco puro.
+
+    Evita recortar viñetas a sangre (full-bleed) o tramas (screentones) que tocan
+    los bordes de la página cerrando primero cualquier tinta/trama y exigiendo que
+    las filas o columnas del margen sean >= 99.5% blancas desde el borde exterior.
+    """
     g = _to_gray(gray)
     h, w = g.shape[:2]
-    band_h = max(8, int(h * edge_band))
-    band_w = max(8, int(w * edge_band))
+    max_h = max(4, int(h * edge_band))
+    max_w = max(4, int(w * edge_band))
 
-    out = np.zeros_like(g, dtype=bool)
-    out[:band_h] |= g[:band_h] >= white_thr
-    out[-band_h:] |= g[-band_h:] >= white_thr
-    out[:, :band_w] |= g[:, :band_w] >= white_thr
-    out[:, -band_w:] |= g[:, -band_w:] >= white_thr
+    # Dilatar cualquier trazo o punto de trama (< white_thr) para no confundir
+    # el fondo blanco entre puntos de screentone con un margen de página.
+    ink = (g < white_thr).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    ink_closed = cv2.dilate(ink, kernel)
+    pure_white = ink_closed == 0
+
+    out = np.zeros((h, w), dtype=bool)
+    min_white_ratio = 0.995
+    min_margin_px = 4
+
+    # Borde superior
+    top = 0
+    while top < max_h and float(np.mean(pure_white[top, :])) >= min_white_ratio:
+        top += 1
+    if top >= min_margin_px:
+        out[:top, :] = True
+
+    # Borde inferior
+    bottom = 0
+    while (
+        bottom < max_h
+        and float(np.mean(pure_white[h - 1 - bottom, :])) >= min_white_ratio
+    ):
+        bottom += 1
+    if bottom >= min_margin_px:
+        out[h - bottom :, :] = True
+
+    # Borde izquierdo
+    left = 0
+    while left < max_w and float(np.mean(pure_white[:, left])) >= min_white_ratio:
+        left += 1
+    if left >= min_margin_px:
+        out[:, :left] = True
+
+    # Borde derecho
+    right = 0
+    while (
+        right < max_w
+        and float(np.mean(pure_white[:, w - 1 - right])) >= min_white_ratio
+    ):
+        right += 1
+    if right >= min_margin_px:
+        out[:, w - right :] = True
+
     return out
 
 
 def combined_neutral_mask(
     gray: np.ndarray,
     *,
-    line_low: int = 60,
     bubble_white: int = 235,
-    gutter_white: int = 240,
-    line_dilate: int = 1,
-    blur: int = 5,
+    gutter_white: int = 245,
+    blur: int = 3,
 ) -> np.ndarray:
+    """Aísla exclusivamente globos de diálogo y márgenes reales para forzar blanco neutro."""
     g = _to_gray(gray)
-    line = lineart_mask(g, low=line_low, dilate=line_dilate)
     bubble = bubble_mask(g, white_thr=bubble_white)
     gutter = gutter_mask(g, white_thr=gutter_white)
 
-    neutralize = line | bubble | gutter
-    keep = (~neutralize).astype(np.float32)
+    neutralize = bubble | gutter
+    if not np.any(neutralize):
+        return np.ones_like(g, dtype=np.float32)
 
+    keep = (~neutralize).astype(np.float32)
     if blur > 0:
         keep = cv2.GaussianBlur(keep, (blur * 2 + 1, blur * 2 + 1), 0)
-    np.clip(keep, 0.0, 1.0, out=keep)
-    return keep
+    return np.clip(keep, 0.0, 1.0)

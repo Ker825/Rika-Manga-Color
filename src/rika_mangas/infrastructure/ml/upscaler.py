@@ -53,10 +53,14 @@ class RRDBNet(nn.Module):
     ) -> None:
         super().__init__()
         if scale != 4:
-            raise ValueError(f"Escala no soportada: {scale}. Solo scale=4 está permitido.")
+            raise ValueError(
+                f"Escala no soportada: {scale}. Solo scale=4 está permitido."
+            )
         self.scale = scale
         self.conv_first = nn.Conv2d(num_in_ch, num_feat, 3, 1, 1)
-        self.body = nn.Sequential(*(RRDB(num_feat, num_grow_ch) for _ in range(num_block)))
+        self.body = nn.Sequential(
+            *(RRDB(num_feat, num_grow_ch) for _ in range(num_block))
+        )
         self.conv_body = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
         self.conv_up1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
         self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
@@ -67,13 +71,19 @@ class RRDBNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.conv_first(x)
         feat = feat + self.conv_body(self.body(feat))
-        feat = self.lrelu(self.conv_up1(F.interpolate(feat, scale_factor=2, mode="nearest")))
-        feat = self.lrelu(self.conv_up2(F.interpolate(feat, scale_factor=2, mode="nearest")))
+        feat = self.lrelu(
+            self.conv_up1(F.interpolate(feat, scale_factor=2, mode="nearest"))
+        )
+        feat = self.lrelu(
+            self.conv_up2(F.interpolate(feat, scale_factor=2, mode="nearest"))
+        )
         return self.conv_last(self.lrelu(self.conv_hr(feat)))
 
 
 class RealESRGANCPUAccumulator(IUpscalerEngine):
-    def __init__(self, weights_path: Path, tile_size: int = 512, tile_pad: int = 10) -> None:
+    def __init__(
+        self, weights_path: Path, tile_size: int = 512, tile_pad: int = 10
+    ) -> None:
         self.weights_path = weights_path
         self.tile_size = tile_size
         self.tile_pad = tile_pad
@@ -93,7 +103,11 @@ class RealESRGANCPUAccumulator(IUpscalerEngine):
         model.load_state_dict(cast(dict[str, torch.Tensor], state_dict), strict=True)
         model.eval()
 
-        self._model = model.half().to(self.device) if self.device.type == "cuda" else model.to(self.device)
+        self._model = (
+            model.half().to(self.device)
+            if self.device.type == "cuda"
+            else model.to(self.device)
+        )
         return self._model
 
     @torch.inference_mode()
@@ -109,7 +123,9 @@ class RealESRGANCPUAccumulator(IUpscalerEngine):
         out_h, out_w = height * self.scale, width * self.scale
 
         # Buffer alojado estrictamente en RAM de CPU
-        output_cpu = torch.zeros((batch, channel, out_h, out_w), dtype=torch.uint8, device="cpu")
+        output_cpu = torch.zeros(
+            (batch, channel, out_h, out_w), dtype=torch.uint8, device="cpu"
+        )
 
         tiles_x = math.ceil(width / self.tile_size)
         tiles_y = math.ceil(height / self.tile_size)
@@ -117,14 +133,19 @@ class RealESRGANCPUAccumulator(IUpscalerEngine):
         for y in range(tiles_y):
             for x in range(tiles_x):
                 x_start, y_start = x * self.tile_size, y * self.tile_size
-                x_end, y_end = min(x_start + self.tile_size, width), min(y_start + self.tile_size, height)
+                x_end, y_end = (
+                    min(x_start + self.tile_size, width),
+                    min(y_start + self.tile_size, height),
+                )
 
                 x_start_pad = max(x_start - self.tile_pad, 0)
                 y_start_pad = max(y_start - self.tile_pad, 0)
                 x_end_pad = min(x_end + self.tile_pad, width)
                 y_end_pad = min(y_end + self.tile_pad, height)
 
-                tile_gpu = img_cpu[:, :, y_start_pad:y_end_pad, x_start_pad:x_end_pad].to(self.device, dtype=self.dtype)
+                tile_gpu = img_cpu[
+                    :, :, y_start_pad:y_end_pad, x_start_pad:x_end_pad
+                ].to(self.device, dtype=self.dtype)
                 out_tile = model(tile_gpu)
 
                 ox_start = (x_start - x_start_pad) * self.scale
@@ -135,7 +156,14 @@ class RealESRGANCPUAccumulator(IUpscalerEngine):
                 dx_start, dy_start = x_start * self.scale, y_start * self.scale
                 dx_end, dy_end = x_end * self.scale, y_end * self.scale
 
-                out_uint8 = out_tile[:, :, oy_start:oy_end, ox_start:ox_end].clamp(0.0, 1.0).mul(255.0).add(0.5).to(torch.uint8).cpu()
+                out_uint8 = (
+                    out_tile[:, :, oy_start:oy_end, ox_start:ox_end]
+                    .clamp(0.0, 1.0)
+                    .mul(255.0)
+                    .add(0.5)
+                    .to(torch.uint8)
+                    .cpu()
+                )
                 output_cpu[:, :, dy_start:dy_end, dx_start:dx_end] = out_uint8
                 del tile_gpu, out_tile, out_uint8
 

@@ -1,123 +1,422 @@
-# infrastructure/ml/hooks.py
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import logging
+from collections.abc import Callable
+from typing import Any, cast
 
 import torch
-import torch.nn.functional as F
-from diffusers.models.attention_processor import Attention
+import torch.nn as nn
+from diffusers.models.attention import BasicTransformerBlock
+from einops import rearrange
 
-if TYPE_CHECKING:
-    from torch.utils.hooks import RemovableHandle
+from rika_mangas.infrastructure.ml.models.attention_processor import AttnProcessor2_0
 
-
-class ReferenceFeatureBank:
-    def __init__(self) -> None:
-        self.features: dict[str, torch.Tensor] = {}
-        self._handles: list[RemovableHandle] = []
-
-    def register(self, module: torch.nn.Module, name: str) -> None:
-        # Pre-hook para capturar hidden_states antes de las proyecciones Q, K, V
-        def pre_hook(_mod: torch.nn.Module, inp: tuple[Any, ...]) -> None:
-            hidden_states = inp[0]
-            self.features[name] = hidden_states.detach()
-
-        handle = module.register_forward_pre_hook(pre_hook)
-        self._handles.append(handle)
-
-    def clear(self) -> None:
-        self.features.clear()
-
-    def remove_hooks(self) -> None:
-        for handle in self._handles:
-            handle.remove()
-        self._handles.clear()
-        self.features.clear()
+logger = logging.getLogger("rika_mangas.hooks")
 
 
-class MangaNinjaAttnProcessor2_0:
-    def __init__(self, block_name: str, bank: ReferenceFeatureBank) -> None:
-        self.block_name = block_name
-        self.bank = bank
-        self.ref_key = block_name
+def _torch_dfs(model: Any) -> list[nn.Module]:
+    """Recorrido DFS recursivo seguro para recopilar submódulos PyTorch."""
+    if not isinstance(model, nn.Module):
+        return []
+    result: list[nn.Module] = [model]
+    for child in model.children():
+        result.extend(_torch_dfs(child))
+    return result
 
-    def __call__(
+
+def _get_block_channel_dim(block: BasicTransformerBlock) -> int:
+    """Extrae la dimensión del canal del bloque transformer para ordenamiento consistente."""
+    norm = getattr(block, "norm1", None)
+    if norm is not None:
+        shape = getattr(norm, "normalized_shape", None)
+        if isinstance(shape, (tuple, list)) and len(shape) > 0:
+            return int(shape[0])
+        if isinstance(shape, int):
+            return shape
+    dim = getattr(block, "dim", 0)
+    return int(dim) if isinstance(dim, int) else 0
+
+
+def _filter_matrices_by_size(
+    matrix_list: list[torch.Tensor] | None, reference_matrix: torch.Tensor
+) -> list[torch.Tensor]:
+    """Filtra embeddings espaciales cuya resolución y canales coinciden con el bloque transformer."""
+    if not matrix_list:
+        return []
+    ref_shape = reference_matrix.shape[-2:]
+    return [m for m in matrix_list if m.shape[-2:] == ref_shape]
+
+
+class ReferenceAttentionControl:
+    """Controlador de Mutual Self-Attention con soporte para Point Hints y desacoplamiento K/V."""
+
+    def __init__(
         self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        temb: torch.Tensor | None = None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        residual = hidden_states
+        unet: nn.Module,
+        mode: str = "write",
+        do_classifier_free_guidance: bool = False,
+        fusion_blocks: str = "full",
+    ) -> None:
+        if mode not in ("read", "write"):
+            raise ValueError("mode debe ser 'read' o 'write'")
+        if fusion_blocks not in ("midup", "full"):
+            raise ValueError("fusion_blocks debe ser 'midup' o 'full'")
 
-        if attn.spatial_norm is not None:
-            hidden_states = attn.spatial_norm(hidden_states, temb)
+        self.unet = unet
+        self.mode = mode
+        self.do_classifier_free_guidance = do_classifier_free_guidance
+        self.fusion_blocks = fusion_blocks
+        self._original_forwards: dict[int, Callable[..., Any]] = {}
+        self._original_processors: dict[int, Any] = {}
 
-        input_ndim = hidden_states.ndim
-        if input_ndim == 4:
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        self.register_reference_hooks()
+
+    def register_reference_hooks(self) -> None:
+        """Registra los hooks de intercepción en los bloques transformer."""
+        if self.fusion_blocks == "midup":
+            mid = getattr(self.unet, "mid_block", None)
+            up = getattr(self.unet, "up_blocks", None)
+            raw_modules = _torch_dfs(mid) + _torch_dfs(up)
         else:
-            batch_size, sequence_length, _ = hidden_states.shape
+            raw_modules = _torch_dfs(self.unet)
 
-        if attn.group_norm is not None:
-            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+        attn_modules = [m for m in raw_modules if isinstance(m, BasicTransformerBlock)]
+        attn_modules = sorted(attn_modules, key=_get_block_channel_dim, reverse=True)
 
-        query = attn.to_q(hidden_states)
-        is_cross_attention = encoder_hidden_states is not None
-        ref_feat = self.bank.features.get(self.ref_key)
+        mode = self.mode
+        do_cfg = self.do_classifier_free_guidance
 
-        if not is_cross_attention and ref_feat is not None:
-            ref_feat = ref_feat.to(device=hidden_states.device, dtype=hidden_states.dtype)
-            if ref_feat.ndim == 4:
-                ref_feat = ref_feat.view(ref_feat.shape[0], ref_feat.shape[1], -1).transpose(1, 2)
+        def hacked_forward(
+            module: BasicTransformerBlock,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            encoder_hidden_states: torch.Tensor | None = None,
+            encoder_attention_mask: torch.Tensor | None = None,
+            timestep: torch.LongTensor | None = None,
+            cross_attention_kwargs: dict[str, Any] | None = None,
+            class_labels: torch.LongTensor | None = None,
+            **kwargs: Any,
+        ) -> torch.Tensor:
+            norm_hidden_states = module.norm1(hidden_states)
+            attn_kwargs = cross_attention_kwargs or {}
 
-            # Ajustar batch_size de ref_feat al de hidden_states (CFG)
-            if ref_feat.shape[0] != batch_size:
-                ref_feat = ref_feat.expand(batch_size, -1, -1)
+            if mode == "write":
+                bank = cast(list[torch.Tensor], getattr(module, "bank", []))
+                bank.append(norm_hidden_states.clone())
+                attn_output = module.attn1(
+                    norm_hidden_states,
+                    encoder_hidden_states=(
+                        encoder_hidden_states if module.only_cross_attention else None
+                    ),
+                    attention_mask=attention_mask,
+                    **attn_kwargs,
+                )
+                hidden_states = attn_output + hidden_states
 
-            key_target = attn.to_k(hidden_states)
-            val_target = attn.to_v(hidden_states)
+            elif mode == "read":
+                read_bank = cast(list[torch.Tensor], getattr(module, "bank", []))
+                if read_bank:
+                    cur_bs = norm_hidden_states.shape[0]
+                    first_ref = read_bank[0]
+                    # Expandir referencia para asegurar coincidencia de longitud con el batch actual
+                    if first_ref.shape[0] == 1:
+                        ref_feat = first_ref.expand(cur_bs, -1, -1)
+                    elif first_ref.shape[0] >= cur_bs:
+                        ref_feat = first_ref[:cur_bs]
+                    else:
+                        ref_feat = first_ref.repeat(cur_bs, 1, 1)[:cur_bs]
 
-            key_ref = attn.to_k(ref_feat)
-            val_ref = attn.to_v(ref_feat)
+                    if do_cfg and cur_bs >= 3:
+                        hidden_states_c = hidden_states.clone()
 
-            key = torch.cat([key_target, key_ref], dim=1)
-            value = torch.cat([val_target, val_ref], dim=1)
-        else:
-            ctx = encoder_hidden_states if is_cross_attention else hidden_states
-            key = attn.to_k(ctx)
-            value = attn.to_v(ctx)
+                        # Incondicional (Solo self-attention sobre sí mismo)
+                        mask_0 = (
+                            attention_mask[0:1] if attention_mask is not None else None
+                        )
+                        hidden_states_c[0:1] = (
+                            module.attn1(
+                                norm_hidden_states[0:1],
+                                encoder_hidden_states=norm_hidden_states[0:1],
+                                attention_mask=mask_0,
+                                **attn_kwargs,
+                            )
+                            + hidden_states[0:1]
+                        )
 
-        inner_dim = key.shape[-1]
-        head_dim = inner_dim // attn.heads
+                        # Referencia (Mutual attention con la referencia, sin hints de puntos)
+                        modify_k_ref = torch.cat(
+                            [norm_hidden_states[1:2], ref_feat[1:2]], dim=1
+                        )
+                        mask_1 = (
+                            attention_mask[1:2] if attention_mask is not None else None
+                        )
+                        hidden_states_c[1:2] = (
+                            module.attn1(
+                                norm_hidden_states[1:2],
+                                encoder_hidden_states=modify_k_ref,
+                                attention_mask=mask_1,
+                                **attn_kwargs,
+                            )
+                            + hidden_states[1:2]
+                        )
 
-        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+                        # Point Hints (Mutual attention inyectando embeddings espaciales en Q y K)
+                        p_main = cast(
+                            list[torch.Tensor],
+                            getattr(module, "point_bank_main", []),
+                        )
+                        p_ref = cast(
+                            list[torch.Tensor],
+                            getattr(module, "point_bank_ref", []),
+                        )
+                        mask_2 = (
+                            attention_mask[2:3] if attention_mask is not None else None
+                        )
 
-        hidden_states = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
+                        if p_main and p_ref:
+                            main_emb = p_main[0]
+                            ref_emb = p_ref[0]
+                            if main_emb.shape[0] != 1:
+                                main_emb = main_emb[0:1]
+                            if ref_emb.shape[0] != 1:
+                                ref_emb = ref_emb[0:1]
+
+                            q_pts = norm_hidden_states[2:3] + main_emb
+                            k_pts = torch.cat([q_pts, ref_feat[2:3] + ref_emb], dim=1)
+                            v_pts = torch.cat(
+                                [norm_hidden_states[2:3], ref_feat[2:3]], dim=1
+                            )
+
+                            hidden_states_c[2:3] = (
+                                module.attn1(
+                                    q_pts,
+                                    encoder_hidden_states=k_pts,
+                                    encoder_hidden_states_v=v_pts,
+                                    attention_mask=mask_2,
+                                    **attn_kwargs,
+                                )
+                                + hidden_states[2:3]
+                            )
+                        else:
+                            hidden_states_c[2:3] = (
+                                module.attn1(
+                                    norm_hidden_states[2:3],
+                                    encoder_hidden_states=modify_k_ref.clone(),
+                                    attention_mask=mask_2,
+                                    **attn_kwargs,
+                                )
+                                + hidden_states[2:3]
+                            )
+
+                        hidden_states = hidden_states_c
+
+                    elif do_cfg and cur_bs == 2:
+                        hidden_states_c = hidden_states.clone()
+
+                        # Incondicional
+                        mask_0 = (
+                            attention_mask[0:1] if attention_mask is not None else None
+                        )
+                        hidden_states_c[0:1] = (
+                            module.attn1(
+                                norm_hidden_states[0:1],
+                                encoder_hidden_states=norm_hidden_states[0:1],
+                                attention_mask=mask_0,
+                                **attn_kwargs,
+                            )
+                            + hidden_states[0:1]
+                        )
+
+                        # Referencia
+                        modify_k_ref = torch.cat(
+                            [norm_hidden_states[1:2], ref_feat[1:2]], dim=1
+                        )
+                        mask_1 = (
+                            attention_mask[1:2] if attention_mask is not None else None
+                        )
+                        hidden_states_c[1:2] = (
+                            module.attn1(
+                                norm_hidden_states[1:2],
+                                encoder_hidden_states=modify_k_ref,
+                                attention_mask=mask_1,
+                                **attn_kwargs,
+                            )
+                            + hidden_states[1:2]
+                        )
+                        hidden_states = hidden_states_c
+
+                    else:
+                        # Modo directo sin CFG o batch simple
+                        p_main = cast(
+                            list[torch.Tensor],
+                            getattr(module, "point_bank_main", []),
+                        )
+                        p_ref = cast(
+                            list[torch.Tensor],
+                            getattr(module, "point_bank_ref", []),
+                        )
+                        if p_main and p_ref:
+                            main_emb = p_main[0].expand(cur_bs, -1, -1)
+                            ref_emb = p_ref[0].expand(cur_bs, -1, -1)
+                            q_pts = norm_hidden_states + main_emb
+                            k_pts = torch.cat([q_pts, ref_feat + ref_emb], dim=1)
+                            v_pts = torch.cat([norm_hidden_states, ref_feat], dim=1)
+                            hidden_states = (
+                                module.attn1(
+                                    q_pts,
+                                    encoder_hidden_states=k_pts,
+                                    encoder_hidden_states_v=v_pts,
+                                    attention_mask=attention_mask,
+                                    **attn_kwargs,
+                                )
+                                + hidden_states
+                            )
+                        else:
+                            modify_k_ref = torch.cat(
+                                [norm_hidden_states, ref_feat], dim=1
+                            )
+                            hidden_states = (
+                                module.attn1(
+                                    norm_hidden_states,
+                                    encoder_hidden_states=modify_k_ref,
+                                    attention_mask=attention_mask,
+                                    **attn_kwargs,
+                                )
+                                + hidden_states
+                            )
+                else:
+                    hidden_states = (
+                        module.attn1(
+                            norm_hidden_states,
+                            attention_mask=attention_mask,
+                            **attn_kwargs,
+                        )
+                        + hidden_states
+                    )
+
+            if module.attn2 is not None:
+                attn_output = module.attn2(
+                    module.norm2(hidden_states),
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=encoder_attention_mask,
+                    **attn_kwargs,
+                )
+                hidden_states = attn_output + hidden_states
+
+            return module.ff(module.norm3(hidden_states)) + hidden_states
+
+        for module in attn_modules:
+            mod_id = id(module)
+            if mod_id not in self._original_forwards:
+                self._original_forwards[mod_id] = module.forward
+            if hasattr(module, "attn1") and hasattr(module.attn1, "processor"):
+                if mod_id not in self._original_processors:
+                    self._original_processors[mod_id] = module.attn1.processor
+                setattr(module.attn1, "processor", AttnProcessor2_0())
+
+            setattr(module, "bank", [])
+            setattr(module, "point_bank_ref", [])
+            setattr(module, "point_bank_main", [])
+            object.__setattr__(
+                module, "forward", hacked_forward.__get__(module, BasicTransformerBlock)
+            )
+
+    def update(
+        self,
+        writer: ReferenceAttentionControl,
+        point_embedding_ref: list[torch.Tensor] | None = None,
+        point_embedding_main: list[torch.Tensor] | None = None,
+        dtype: torch.dtype = torch.float16,
+    ) -> None:
+        """Copia el banco de características del escritor al lector y enlaza embeddings de puntos."""
+        reader_modules = [
+            m
+            for m in (
+                _torch_dfs(getattr(self.unet, "mid_block", None))
+                + _torch_dfs(getattr(self.unet, "up_blocks", None))
+                if self.fusion_blocks == "midup"
+                else _torch_dfs(self.unet)
+            )
+            if isinstance(m, BasicTransformerBlock)
+        ]
+        writer_modules = [
+            m
+            for m in (
+                _torch_dfs(getattr(writer.unet, "mid_block", None))
+                + _torch_dfs(getattr(writer.unet, "up_blocks", None))
+                if writer.fusion_blocks == "midup"
+                else _torch_dfs(writer.unet)
+            )
+            if isinstance(m, BasicTransformerBlock)
+        ]
+
+        reader_modules = sorted(
+            reader_modules, key=_get_block_channel_dim, reverse=True
+        )
+        writer_modules = sorted(
+            writer_modules, key=_get_block_channel_dim, reverse=True
         )
 
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
-        hidden_states = hidden_states.to(query.dtype)
+        if len(reader_modules) != len(writer_modules):
+            raise ValueError(
+                f"Discrepancia en cantidad de bloques de atencion: "
+                f"Reader={len(reader_modules)}, Writer={len(writer_modules)}"
+            )
 
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
+        for r, w in zip(reader_modules, writer_modules, strict=True):
+            source_bank = cast(list[torch.Tensor], getattr(w, "bank", []))
+            cloned_bank = [v.clone().to(dtype) for v in source_bank]
+            setattr(r, "bank", cloned_bank)
 
-        if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+            if (
+                point_embedding_main is not None
+                and point_embedding_ref is not None
+                and cloned_bank
+            ):
+                ref_mat = cloned_bank[0]
+                setattr(
+                    r,
+                    "point_bank_ref",
+                    _filter_matrices_by_size(point_embedding_ref, ref_mat),
+                )
+                setattr(
+                    r,
+                    "point_bank_main",
+                    _filter_matrices_by_size(point_embedding_main, ref_mat),
+                )
 
-        if attn.residual_connection:
-            hidden_states = hidden_states + residual
+    def clear(self) -> None:
+        """Limpia los buffers de memoria de atención sin desregistrar los hooks."""
+        modules = [
+            m for m in _torch_dfs(self.unet) if isinstance(m, BasicTransformerBlock)
+        ]
+        for m in modules:
+            bank = getattr(m, "bank", None)
+            if isinstance(bank, list):
+                bank.clear()
+            p_ref = getattr(m, "point_bank_ref", None)
+            if isinstance(p_ref, list):
+                p_ref.clear()
+            p_main = getattr(m, "point_bank_main", None)
+            if isinstance(p_main, list):
+                p_main.clear()
 
-        return hidden_states / attn.rescale_output_factor
+    def remove_hooks(self) -> None:
+        """Restaura los métodos forward y procesadores originales para evitar fugas."""
+        self.clear()
+        modules = [
+            m for m in _torch_dfs(self.unet) if isinstance(m, BasicTransformerBlock)
+        ]
+        for m in modules:
+            mod_id = id(m)
+            if mod_id in self._original_forwards:
+                object.__setattr__(m, "forward", self._original_forwards[mod_id])
+            if (
+                mod_id in self._original_processors
+                and hasattr(m, "attn1")
+                and hasattr(m.attn1, "processor")
+            ):
+                m.attn1.processor = self._original_processors[mod_id]
+
+        self._original_forwards.clear()
+        self._original_processors.clear()

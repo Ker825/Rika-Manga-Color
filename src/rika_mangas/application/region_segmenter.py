@@ -7,12 +7,16 @@ _SEG_MAX_EDGE = 1400
 
 
 class SegmentationResult:
-    def __init__(self, regions: list[PageRegion], labels: np.ndarray, scale: float) -> None:
+    def __init__(
+        self, regions: list[PageRegion], labels: np.ndarray, scale: float
+    ) -> None:
         self.regions = regions
         self.labels = labels
         self.scale = scale
 
-    def interior_points(self, region: PageRegion, spacing: int = 110, max_points: int = 12) -> list[tuple[int, int]]:
+    def interior_points(
+        self, region: PageRegion, spacing: int = 110, max_points: int = 12
+    ) -> list[tuple[int, int]]:
         mask = (self.labels == region.label_id).astype(np.uint8)
         dist = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
         step = max(24, int(spacing * self.scale))
@@ -42,12 +46,16 @@ def segment_regions(
     g = gray_img
     if max(h, w) > _SEG_MAX_EDGE:
         scale = _SEG_MAX_EDGE / max(h, w)
-        g = cv2.resize(gray_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        g = cv2.resize(
+            gray_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA
+        )
 
     gh, gw = g.shape[:2]
     ink: np.ndarray = (g < line_low).astype(np.uint8)
     if gap_close > 0:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * gap_close + 1, 2 * gap_close + 1))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * gap_close + 1, 2 * gap_close + 1)
+        )
         ink = cv2.dilate(ink, kernel)
 
     fillable = (ink == 0).astype(np.uint8)
@@ -73,7 +81,9 @@ def segment_regions(
         iy, ix = np.unravel_index(int(np.argmax(dist)), dist.shape)
         mean_gray = float(g[y : y + hh, x : x + ww][crop_mask.astype(bool)].mean())
 
-        bbox = RegionBBox(x=int(x * inv), y=int(y * inv), w=int(ww * inv), h=int(hh * inv))
+        bbox = RegionBBox(
+            x=int(x * inv), y=int(y * inv), w=int(ww * inv), h=int(hh * inv)
+        )
         regions.append(
             PageRegion(
                 label_id=int(i),
