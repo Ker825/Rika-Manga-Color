@@ -1,4 +1,6 @@
 import argparse
+import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 
@@ -34,14 +36,14 @@ def download_manganinja() -> None:
 
 
 def download_base_components() -> None:
-    # 1. SD 1.5 (VAE, Scheduler, UNet base)
+    # 1. SD 1.5 (VAE, Scheduler, UNet base config)
     sd15_dir = BASE_WEIGHTS / "sd15"
     if not (sd15_dir / "unet").exists() or not (sd15_dir / "vae").exists():
         print("[*] Descargando componentes base de SD 1.5...")
         snapshot_download(
             repo_id="stable-diffusion-v1-5/stable-diffusion-v1-5",
             local_dir=sd15_dir,
-            allow_patterns=["unet/*", "vae/*", "scheduler/*"],
+            allow_patterns=["unet/*", "vae/*.json", "vae/*.safetensors", "scheduler/*"],
         )
 
     # 2. CLIP Vision (image_encoder y processor)
@@ -51,7 +53,7 @@ def download_base_components() -> None:
         snapshot_download(
             repo_id="openai/clip-vit-large-patch14",
             local_dir=clip_dir,
-            allow_patterns=["*.json", "*.safetensors", "*.bin", "*.txt"],
+            allow_patterns=["*.json", "*.safetensors"],
         )
 
     # 3. ControlNet Lineart
@@ -61,10 +63,23 @@ def download_base_components() -> None:
         snapshot_download(
             repo_id="lllyasviel/control_v11p_sd15_lineart",
             local_dir=cnet_dir,
-            allow_patterns=["*.json", "*.safetensors", "*.bin"],
+            allow_patterns=["*.json", "*.safetensors"],
         )
 
-    # 4. Real-ESRGAN Anime 6B
+    # 4. Annotators (Lineart sk_model.pth)
+    annotators_dir = BASE_WEIGHTS / "annotators"
+    annotators_dir.mkdir(parents=True, exist_ok=True)
+    sk_path = annotators_dir / "sk_model.pth"
+    if not sk_path.is_file():
+        print("[*] Descargando Lineart Annotator (sk_model.pth)...")
+        hf_hub_download(
+            repo_id="lllyasviel/Annotators",
+            filename="sk_model.pth",
+            local_dir=annotators_dir,
+        )
+        print("  [OK] sk_model.pth listo.")
+
+    # 5. Real-ESRGAN Anime 6B
     esrgan_path = BASE_WEIGHTS / "RealESRGAN_x4plus_anime_6B.pth"
     if not esrgan_path.is_file():
         print("[*] Descargando RealESRGAN_x4plus_anime_6B.pth...")
@@ -76,6 +91,7 @@ def download_base_components() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Descarga de pesos para Rika Mangas")
     parser.add_argument("--only-manganinja", action="store_true", help="Descarga únicamente los checkpoints de MangaNinja")
+    parser.add_argument("--convert-fp16", action="store_true", help="Ejecuta la conversión a FP16 tras finalizar la descarga")
     args = parser.parse_args()
 
     BASE_WEIGHTS.mkdir(parents=True, exist_ok=True)
@@ -85,6 +101,10 @@ def main() -> None:
         download_base_components()
 
     print("\n[V] Descarga completada exitosamente.")
+
+    if args.convert_fp16:
+        print("\n[*] Iniciando conversión automática a FP16...")
+        subprocess.run([sys.executable, "scripts/convert_models_to_fp16.py"], check=True)
 
 
 if __name__ == "__main__":

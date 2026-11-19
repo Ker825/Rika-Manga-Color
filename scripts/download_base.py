@@ -21,7 +21,7 @@ hf_hub_download(
 snapshot_download(
     repo_id="stable-diffusion-v1-5/stable-diffusion-v1-5",
     local_dir=sd15_dir,
-    allow_patterns=["vae/*"],
+    allow_patterns=["vae/*.json", "vae/*.safetensors"],
 )
 
 # 2. ControlNet Lineart: Solo config.json
@@ -40,6 +40,16 @@ snapshot_download(
     repo_id="openai/clip-vit-large-patch14",
     local_dir=clip_dir,
     allow_patterns=["*.json", "*.safetensors"],
+)
+
+# 4. Annotators (Lineart sk_model.pth)
+annotators_dir = base_weights / "annotators"
+annotators_dir.mkdir(parents=True, exist_ok=True)
+print("[*] Descargando Lineart Annotator (sk_model.pth)...")
+hf_hub_download(
+    repo_id="lllyasviel/Annotators",
+    filename="sk_model.pth",
+    local_dir=annotators_dir,
 )
 
 print("\n[OK] Componentes base instalados correctamente.")
