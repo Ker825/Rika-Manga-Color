@@ -21,3 +21,6 @@ storage/output/*
 
 storage/uploads/
 storage/uploads/*
+
+# Knowledge graph cache
+graphify-out/

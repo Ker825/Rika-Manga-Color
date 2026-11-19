@@ -7,7 +7,7 @@ authors = [
     { name = "Ker825", email = "cisnerosriveradiegoemmanuel@gmail.com" }
 ]
 license = { text = "MIT" }
-requires-python = ">=3.12, <3.14"
+requires-python = ">=3.12, <3.14.9"
 dependencies = [
     "accelerate>=1.2.1",
     "diffusers>=0.32.1",
@@ -38,6 +38,24 @@ explicit_package_bases = true
 
 [tool.ruff]
 line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "A",
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "N",
+    "PERF",
+    "S",
+    "SIM",
+    "ASYNC",
+    "RUF"
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu124"
