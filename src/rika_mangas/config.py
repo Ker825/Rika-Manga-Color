@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     CLIP_LOCAL_DIR: Path = WEIGHTS_DIR / "clip"
     CONTROLNET_LINEART_LOCAL_DIR: Path = WEIGHTS_DIR / "controlnet_lineart"
     MANGANINJA_WEIGHTS_DIR: Path = WEIGHTS_DIR / "manganinja"
+    ANNOTATORS_DIR: Path = WEIGHTS_DIR / "annotators"
+    LINEART_ANNOTATOR_PATH: Path = ANNOTATORS_DIR / "sk_model.pth"
     ESRGAN_WEIGHTS_PATH: Path = WEIGHTS_DIR / "RealESRGAN_x4plus_anime_6B.pth"
 
     TEMPLATES_DIR: Path = BASE_DIR / "presentation" / "web" / "static" / "templates"
@@ -33,7 +35,7 @@ class Settings(BaseSettings):
 
     MAX_IMAGE_PIXELS: int = 20_000_000
     MAX_DIMENSION: int = 4096
-    MANGANINJA_STEPS: int = 16
+    MANGANINJA_STEPS: int = 30
     MANGANINJA_TILE_SIZE: int = 512
     CHARACTER_BLEND_STRENGTH: float = 0.55
     ESRGAN_TILE_SIZE: int = 512
