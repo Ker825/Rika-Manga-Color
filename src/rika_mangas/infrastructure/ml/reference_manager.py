@@ -37,7 +37,8 @@ class ReferenceManager:
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[np.ndarray, torch.Tensor]:
-        """Redimensiona y normaliza la referencia al rango [-1.0, 1.0] como tensor PyTorch."""
+        """Prepara RGB original para CLIP y el tensor reescalado [-1.0, 1.0] para RefUNet."""
+        orig_ref_rgb = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2RGB)
         ref_resized = cv2.resize(
             ref_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA
         )
@@ -49,4 +50,4 @@ class ReferenceManager:
             .unsqueeze(0)
             .to(device=device, dtype=dtype)
         )
-        return ref_rgb, ref_tensor
+        return orig_ref_rgb, ref_tensor

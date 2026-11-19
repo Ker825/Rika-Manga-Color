@@ -2,7 +2,9 @@ from typing import Protocol
 
 import numpy as np
 
-type HintPoint = tuple[float, float, tuple[int, int, int]]
+type HintPoint = (
+    tuple[float, float, tuple[int, int, int]] | tuple[float, float, float, float]
+)
 
 
 class IColorizerEngine(Protocol):
@@ -14,10 +16,10 @@ class IColorizerEngine(Protocol):
         *,
         reference_images: list[np.ndarray] | None = None,
         size: int = 512,
-        steps: int = 16,
-        denoise_sigma: int = 15,
+        steps: int = 30,
+        denoise_sigma: int = 0,
         tiled: bool = False,
-        tile_size: int = 768,
+        tile_size: int = 512,
         tile_overlap: int = 96,
         hint_points: list[HintPoint] | None = None,
     ) -> np.ndarray: ...
