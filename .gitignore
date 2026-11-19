@@ -24,3 +24,7 @@ storage/uploads/*
 
 # Knowledge graph cache
 graphify-out/
+
+# Local documentation
+docs/
+docs/
