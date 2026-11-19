@@ -12,7 +12,7 @@ import torch.nn as nn
 from diffusers import (
     AutoencoderKL,
     ControlNetModel,
-    DPMSolverMultistepScheduler,
+    DDIMScheduler,
 )
 from transformers import (
     CLIPImageProcessor,
@@ -22,6 +22,7 @@ from transformers import (
 from rika_mangas.config import settings
 from rika_mangas.domain.ports.ports import HintPoint, IColorizerEngine
 from rika_mangas.infrastructure.ml.hooks import ReferenceAttentionControl
+from rika_mangas.infrastructure.ml.lineart_detector import BatchLineartDetector
 from rika_mangas.infrastructure.ml.models.refunet_2d_condition import (
     RefUNet2DConditionModel,
 )
@@ -76,6 +77,7 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
     reference_unet: RefUNet2DConditionModel | None
     controlnet: Any | None
     point_net: PointNet | None
+    lineart_detector: BatchLineartDetector | None
     uncond_embed: torch.Tensor | None
 
     def __init__(self) -> None:
@@ -94,6 +96,7 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
         self.reference_unet = None
         self.controlnet = None
         self.point_net = None
+        self.lineart_detector = None
         self.uncond_embed = None
 
     def load(self) -> None:
@@ -103,12 +106,10 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
 
         logger.info("Cargando componentes nativos de MangaNinja...")
 
-        # 1. Scheduler DPMSolver++ optimizado para fidelidad de color
-        sched_raw: Any = DPMSolverMultistepScheduler.from_pretrained(
+        # 1. Scheduler DDIM nativo de MangaNinja
+        sched_raw: Any = DDIMScheduler.from_pretrained(
             str(settings.SD_15_LOCAL_DIR),
             subfolder="scheduler",
-            algorithm_type="dpmsolver++",
-            use_karras_sigmas=True,
             local_files_only=True,
         )
         self.scheduler = sched_raw[0] if isinstance(sched_raw, tuple) else sched_raw
@@ -206,6 +207,18 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
         _move_to(point_net, dtype=self.dtype)
         self.point_net = point_net
 
+        # 9. Detector neuronal de lineart (sk_model.pth)
+        if settings.LINEART_ANNOTATOR_PATH.is_file():
+            detector = BatchLineartDetector(settings.LINEART_ANNOTATOR_PATH)
+            _move_to(detector, "cpu", dtype=torch.float32)
+            self.lineart_detector = detector
+        else:
+            logger.warning(
+                "Annotator sk_model.pth no encontrado en %s; se usará fallback OpenCV.",
+                settings.LINEART_ANNOTATOR_PATH,
+            )
+            self.lineart_detector = None
+
         self._loaded = True
         logger.info("MangaNinja inicializado correctamente.")
 
@@ -224,15 +237,35 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
         return orig_w, orig_h, pad_w, pad_h, img_resized
 
     def _prepare_lineart_condition(
-        self, img_padded: np.ndarray, denoise_sigma: int = 0
+        self,
+        img_padded: np.ndarray,
+        denoise_sigma: int = 0,
+        is_lineart: bool = False,
     ) -> torch.Tensor:
         """Extrae y normaliza el mapa de lineart según el protocolo nativo de MangaNinja."""
+        if not is_lineart and self.lineart_detector is not None:
+            rgb = cv2.cvtColor(img_padded, cv2.COLOR_BGR2RGB).astype(np.float32)
+            rgb_norm = (rgb / 255.0) * 2.0 - 1.0
+            rgb_tensor = (
+                torch.from_numpy(rgb_norm)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(device=self.device, dtype=torch.float32)
+            )
+            _move_to(self.lineart_detector, self.device, dtype=torch.float32)
+            edge = self.lineart_detector(rgb_tensor)
+            _move_to(self.lineart_detector, "cpu")
+            edge[edge <= 0.24] = 0.0
+            return (edge.repeat(1, 3, 1, 1) * 2.0 - 1.0).to(
+                device=self.device, dtype=self.dtype
+            )
+
         gray_u8 = cv2.cvtColor(img_padded, cv2.COLOR_BGR2GRAY)
-        if denoise_sigma > 0:
-            # Suavizado bilateral ligero que atenúa micro-tramas preservando trazos
-            gray_u8 = cv2.bilateralFilter(gray_u8, d=5, sigmaColor=float(denoise_sigma), sigmaSpace=3.0)
-        # ControlNet lineart requiere líneas BLANCAS (1.0) sobre fondo NEGRO (0.0).
-        # El manga original tiene tinta negra sobre papel blanco, por lo que debe invertirse.
+        if denoise_sigma > 0 and not is_lineart:
+            gray_u8 = cv2.bilateralFilter(
+                gray_u8, d=5, sigmaColor=float(denoise_sigma), sigmaSpace=3.0
+            )
+        # ControlNet lineart requiere líneas blancas (1.0) sobre fondo negro (0.0).
         lines = 1.0 - (gray_u8.astype(np.float32) / 255.0)
         edge = (
             torch.from_numpy(lines)
@@ -240,9 +273,7 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
             .unsqueeze(0)
             .to(device=self.device, dtype=self.dtype)
         )
-        # Umbralización para eliminar ruido de tramas suaves dejando fondo negro limpio
-        edge[edge <= 0.20] = 0.0
-        # Normalización [-1.0, 1.0] con 3 canales para ControlNet
+        edge[edge <= 0.24] = 0.0
         return edge.repeat(1, 3, 1, 1) * 2.0 - 1.0
 
     def colorize_page(
@@ -250,15 +281,16 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
         image_bgr: np.ndarray,
         *,
         reference_images: list[np.ndarray] | None = None,
-        size: int = 768,
-        steps: int = 20,
-        denoise_sigma: int = 15,
+        size: int = settings.MANGANINJA_TILE_SIZE,
+        steps: int = settings.MANGANINJA_STEPS,
+        denoise_sigma: int = 0,
+        is_lineart: bool = False,
         tiled: bool = False,
-        tile_size: int = 768,
+        tile_size: int = settings.MANGANINJA_TILE_SIZE,
         tile_overlap: int = 96,
         hint_points: list[HintPoint] | None = None,
-        guidance_scale_ref: float = 6.0,
-        guidance_scale_point: float = 10.0,
+        guidance_scale_ref: float = 9.0,
+        guidance_scale_point: float = 15.0,
         **kwargs: Any,
     ) -> np.ndarray:
         """Ejecuta el ciclo de colorización completa por difusión con mutual attention."""
@@ -309,36 +341,28 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
 
             uncond_embeds = self.uncond_embed.to(device=self.device, dtype=self.dtype)
 
-            # 3. Determinación de CFG (3-vías con puntos, 2-vías sin puntos)
-            has_points = bool(hint_points and len(hint_points) > 0)
-            point_ref_embs: list[torch.Tensor] | None = None
-            point_main_embs: list[torch.Tensor] | None = None
+            # 3. Codificación espacial PointNet y CFG de 3 vías (idéntico a MangaNinjiaPipeline)
+            num_cfg = 3
+            point_mask_ref, point_mask_main = PointManager.generate_point_masks(
+                hint_points,
+                pad_w,
+                pad_h,
+                self.device,
+                self.dtype,
+                ref_bgr=ref_bgr,
+            )
+            _move_to(self.point_net, self.device)
+            point_main_embs = PointManager.encode_points(
+                self.point_net, point_mask_main
+            )
+            point_ref_embs = PointManager.encode_points(
+                self.point_net, point_mask_ref
+            )
+            _move_to(self.point_net, "cpu")
 
-            if has_points:
-                num_cfg = 3
-                point_mask_main = PointManager.generate_point_mask(
-                    hint_points, pad_w, pad_h, self.device, self.dtype
-                )
-                point_mask_ref = torch.zeros(
-                    (1, 1, pad_h, pad_w), device=self.device, dtype=self.dtype
-                )
-                _move_to(self.point_net, self.device)
-                point_main_embs = PointManager.encode_points(
-                    self.point_net, point_mask_main
-                )
-                point_ref_embs = PointManager.encode_points(
-                    self.point_net, point_mask_ref
-                )
-                _move_to(self.point_net, "cpu")
-
-                cfg_encoder_hidden_states = torch.cat(
-                    [uncond_embeds, ref_embeds, ref_embeds], dim=0
-                )
-            else:
-                num_cfg = 2
-                cfg_encoder_hidden_states = torch.cat(
-                    [uncond_embeds, ref_embeds], dim=0
-                )
+            cfg_encoder_hidden_states = torch.cat(
+                [uncond_embeds, ref_embeds, ref_embeds], dim=0
+            )
 
             # 4. Configuración de hooks de Mutual Self-Attention
             writer: ReferenceAttentionControl | None = None
@@ -380,7 +404,9 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
                     torch.cuda.empty_cache()
 
                 # 6. Preparación de lineart y latentes de partida
-                edge_cond = self._prepare_lineart_condition(img_padded, denoise_sigma)
+                edge_cond = self._prepare_lineart_condition(
+                    img_padded, denoise_sigma=denoise_sigma, is_lineart=is_lineart
+                )
                 cfg_cond_tensor = edge_cond.repeat(num_cfg, 1, 1, 1)
 
                 latents = torch.randn(
@@ -421,23 +447,17 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
                     )
                     pred_sample = unet_out[0]
 
-                    # 8. Predicción de ruido guiada por clasificador (CFG)
-                    if num_cfg == 3:
-                        noise_pred_uncond, noise_pred_ref, noise_pred_point = (
-                            pred_sample.chunk(3)
-                        )
-                        noise_pred_1 = noise_pred_uncond + guidance_scale_ref * (
-                            noise_pred_ref - noise_pred_uncond
-                        )
-                        noise_pred_2 = noise_pred_ref + guidance_scale_point * (
-                            noise_pred_point - noise_pred_ref
-                        )
-                        noise_pred = (noise_pred_1 + noise_pred_2) / 2.0
-                    else:
-                        noise_pred_uncond, noise_pred_ref = pred_sample.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale_ref * (
-                            noise_pred_ref - noise_pred_uncond
-                        )
+                    # 8. Predicción de ruido guiada por clasificador (CFG 3 vías)
+                    noise_pred_uncond, noise_pred_ref, noise_pred_point = (
+                        pred_sample.chunk(3)
+                    )
+                    noise_pred_1 = noise_pred_uncond + guidance_scale_ref * (
+                        noise_pred_ref - noise_pred_uncond
+                    )
+                    noise_pred_2 = noise_pred_ref + guidance_scale_point * (
+                        noise_pred_point - noise_pred_ref
+                    )
+                    noise_pred = (noise_pred_1 + noise_pred_2) / 2.0
 
                     step_res: Any = self.scheduler.step(
                         noise_pred, t, latents, return_dict=False
@@ -447,7 +467,6 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
                         if isinstance(step_res, tuple)
                         else step_res.prev_sample
                     )
-                    latents = torch.clamp(latents, -4.5, 4.5)
 
                 # 9. Decodificación final de latentes con VAE
                 _move_to(self.controlnet, "cpu")
@@ -456,9 +475,7 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
                     torch.cuda.empty_cache()
 
                 _move_to(self.vae, self.device)
-                latents_scaled = (latents / self.RGB_LATENT_SCALE_FACTOR).clamp(
-                    -12.0, 12.0
-                )
+                latents_scaled = latents / self.RGB_LATENT_SCALE_FACTOR
                 dec_out: Any = self.vae.decode(
                     latents_scaled,
                     return_dict=False,
@@ -498,6 +515,7 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
                     self.vae,
                     self.point_net,
                     self.image_encoder,
+                    self.lineart_detector,
                 ):
                     if component is not None:
                         with suppress(Exception):
@@ -516,6 +534,7 @@ class MangaNinjaStagedColorizer(IColorizerEngine):
             self.reference_unet = None
             self.controlnet = None
             self.point_net = None
+            self.lineart_detector = None
             self.scheduler = None
             self.uncond_embed = None
             self._loaded = False
